@@ -1513,11 +1513,17 @@ class RayPPOTrainer:
 
                 is_last_step = self.global_steps >= self.total_training_steps
                 with marked_timer("step", timing_raw):
-                    # generate a batch
+                    # ---- 步骤 1: [gen] 异步 rollout ----
+                    # async_rollout_manager 内部同时驱动：
+                    #   - 学生模型 vLLM 生成响应（rollout.n=1，每 prompt 1 条）
+                    #   - 教师模型 vLLM 对相同序列计算 token 级 log-prob（蒸馏信号）
+                    # sleep_replicas() 让 vLLM 释放 GPU 显存，供 FSDP 训练使用
                     with marked_timer("gen", timing_raw, color="red"):
                         if curr_step_profile:
                             self.llm_server_manager.start_profile()
                         combined_gen_output = self.async_rollout_manager.generate_sequences(combined_gen_batch)
+                        # rollout 完成后让 vLLM 进入 sleep 状态，释放 KV cache 显存
+                        # FSDP 训练时需要全部 8 块 GPU 的显存
                         self.checkpoint_manager.sleep_replicas()
                         if curr_step_profile:
                             self.llm_server_manager.stop_profile()
