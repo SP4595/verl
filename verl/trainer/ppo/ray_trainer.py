@@ -284,11 +284,35 @@ def compute_advantage(
     "main_ppo.py is deprecated, and wil be replaced by main_ppo_sync.py in v0.8.0, please use main_ppo_sync.py instead."
 )
 class RayPPOTrainer:
-    """Distributed PPO trainer using Ray for scalable reinforcement learning.
+    """基于 Ray 的分布式 PPO/蒸馏训练器，是整个训练流程的核心调度引擎。
 
-    This trainer orchestrates distributed PPO training across multiple nodes and GPUs,
-    managing actor rollouts, critic training, and reward computation with Ray backend.
-    Supports various model architectures including FSDP, Megatron, vLLM, and SGLang integration.
+    run_qwen3_8b_fsdp.sh → main_ppo.py → TaskRunner.run() → 本类
+
+    本类运行在 Ray driver 进程（单 CPU 节点），通过 RPC 调用分散在各 GPU 上的
+    Worker Group，构建完整的 PPO 数据流（Rollout → Reward → Advantage → Update）。
+
+    ┌─────────────────────────────────────────────────────────────────────────┐
+    │  Driver 进程 (RayPPOTrainer)                                            │
+    │    ├─ actor_rollout_wg  [global_pool, 8 GPU]  学生模型                  │
+    │    │    ├─ ActorRolloutRefWorker: FSDP 训练 + vLLM rollout + Ref 三合一 │
+    │    │    └─ rollout_tp=2: 每次 vLLM 推理横跨 2 块 GPU                   │
+    │    ├─ teacher_model_manager [teacher_pool, 4 GPU]  教师模型             │
+    │    │    └─ MultiTeacherModelManager: Qwen3-32B vLLM 推理               │
+    │    └─ reward_loop_manager  奖励计算（规则/神经网络奖励函数）             │
+    └─────────────────────────────────────────────────────────────────────────┘
+
+    对应 run_qwen3_8b_fsdp.sh 的关键配置映射:
+      trainer.n_gpus_per_node=8   → global_pool 大小
+      distillation.n_gpus_per_node=4 → teacher_pool 大小
+      algorithm.adv_estimator=grpo → fit() 中 compute_advantage() 使用 GRPO 估计器
+      trainer.test_freq=5         → fit() 每 5 步跑一次 _validate()
+      trainer.save_freq=200       → fit() 每 200 步调用 _save_checkpoint()
+      trainer.balance_batch=True  → fit() 每步调用 _balance_batch()
+
+    主要方法:
+      __init__(): 存储配置，创建 DataLoader，注册 KL 控制器
+      init_workers(): 在 Ray 上拉起所有 Worker Group（学生+教师+奖励）
+      fit(): 训练主循环，驱动 rollout→reward→advantage→update 数据流
     """
 
     # TODO: support each role have individual ray_worker_group_cls,
@@ -773,20 +797,45 @@ class RayPPOTrainer:
         return self._val_metrics_update(data_sources, sample_uids, reward_extra_infos_dict, sample_turns)
 
     def init_workers(self):
-        """Initialize distributed training workers using Ray backend.
+        """在 Ray 集群上创建并初始化所有分布式 Worker Group。
 
-        Creates:
-        1. Ray resource pools from configuration
-        2. Worker groups for each role (actor, critic, etc.)
+        由 TaskRunner.run() 在 trainer.fit() 之前调用，完成以下工作:
+          1. 在 Ray 上分配 GPU 资源池（global_pool 和 teacher_pool）
+          2. 实例化学生模型 Worker（ActorRolloutRefWorker, FSDP + vLLM）
+          3. 如果需要，实例化 Critic Worker（GRPO 模式下不需要）
+          4. 如果需要，实例化独立 Ref Policy Worker（无 LoRA 时融合到 actor_rollout_wg）
+          5. 使用 create_colocated_worker_cls 将同一 GPU 池的 Worker 并置（共享显存）
+          6. 初始化教师模型 Manager（MultiTeacherModelManager, Qwen3-32B vLLM）
+          7. 初始化奖励函数 Manager（RewardLoopManager）
+          8. 初始化 AgentLoopManager（异步 rollout 调度器）
+          9. 初始化 CheckpointEngineManager
+
+        run_qwen3_8b_fsdp.sh 配置下的 Worker 拓扑:
+          global_pool [8 GPU]:
+            ActorRolloutRefWorker × (8 / rollout_tp=2) = 4 个 vLLM 实例
+            FSDP 训练时全 8 块 GPU 参与
+          teacher_pool [4 GPU]:
+            Qwen3-32B vLLM，tensor_parallel=2，2 个副本
+
+        执行完本方法后 self 新增的关键属性:
+          self.actor_rollout_wg       学生模型 Worker Group（训练+推理）
+          self.teacher_model_manager  教师模型 Manager（蒸馏信号来源）
+          self.async_rollout_manager  异步 rollout 调度器（AgentLoopManager）
+          self.checkpoint_manager     权重同步和 checkpoint 管理器
         """
+        # 在 Ray 集群上按 resource_pool_spec 分配 GPU 资源（global_pool + teacher_pool）
         self.resource_pool_manager.create_resource_pool()
 
         self.resource_pool_to_cls = {pool: {} for pool in self.resource_pool_manager.resource_pool_dict.values()}
 
-        # create actor and rollout
+        # ---------- 创建学生模型 Actor/Rollout Worker ----------
+        # 无 LoRA 时使用 ActorRolloutRef（Ref 政策融合进同一 Worker）
+        # 有 LoRA 时使用 ActorRollout（Ref 政策需额外加载 base model）
         actor_role = Role.ActorRolloutRef if Role.ActorRolloutRef in self.role_worker_mapping else Role.ActorRollout
         if self.hybrid_engine:
             actor_rollout_resource_pool = self.resource_pool_manager.get_resource_pool(actor_role)
+            # 将 distillation_config 传入 Worker，使其在 forward 时能挂载 logit_processor
+            # 对应 run_qwen3_8b_fsdp.sh: distillation.enabled=True
             actor_rollout_cls = RayClassWithInitArgs(
                 cls=self.role_worker_mapping[actor_role],
                 config=self.config.actor_rollout_ref,
@@ -797,7 +846,8 @@ class RayPPOTrainer:
         else:
             raise NotImplementedError
 
-        # create critic
+        # ---------- 创建 Critic Worker ----------
+        # GRPO 模式（run_qwen3_8b_fsdp.sh: adv_estimator=grpo）下 use_critic=False，跳过
         if self.use_critic:
             resource_pool = self.resource_pool_manager.get_resource_pool(Role.Critic)
 
