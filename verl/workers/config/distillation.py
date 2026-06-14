@@ -11,6 +11,29 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# =============================================================================
+# On-Policy 蒸馏相关配置数据类
+#
+# 本模块定义三个层次的配置类，直接对应 run_qwen3_8b_fsdp.sh 中 EXTRA 数组
+# 的 distillation.* 配置路径:
+#
+#   shell 参数路径                                    → Python 配置类字段
+#   ─────────────────────────────────────────────────────────────────────
+#   distillation.enabled=True                        → DistillationConfig.enabled
+#   distillation.n_gpus_per_node=4                   → DistillationConfig.n_gpus_per_node
+#   distillation.nnodes=1                            → DistillationConfig.nnodes
+#   distillation.teacher_models.teacher_model.*      → DistillationTeacherModelConfig.*
+#   distillation.distillation_loss.loss_mode=k1      → DistillationLossConfig.loss_mode
+#   distillation.distillation_loss.topk=64           → DistillationLossConfig.topk
+#   distillation.distillation_loss.use_task_rewards  → DistillationLossConfig.use_task_rewards
+#   distillation.distillation_loss.use_policy_gradient → DistillationLossConfig.use_policy_gradient
+#   distillation.distillation_loss.loss_max_clamp    → DistillationLossConfig.loss_max_clamp
+#   distillation.distillation_loss.log_prob_min_clamp → DistillationLossConfig.log_prob_min_clamp
+#
+# 配置类实例化发生在 TaskRunner.run() 调用 validate_config() 之前，
+# 由 verl/utils/config.py 中的 omega_conf_to_dataclass() 将 OmegaConf
+# DictConfig 转换为类型化的 Python dataclass 实例。
+# =============================================================================
 
 import logging
 import os
@@ -62,15 +85,34 @@ class DistillationLossConfig(BaseConfig):
         Runtime-populated settings based on loss_mode. Not set by user.
     """
 
+    # 对应 run_qwen3_8b_fsdp.sh: DISTILLATION_LOSS_MODE=k1
+    # 可选: "kl"/"k1"/"abs"/"mse"/"k2"/"k3"/"low_var_kl"（estimator 类）
+    #        或 "forward_kl_topk"（top-k 类，需同时设置 topk 和教师 max_logprobs）
     loss_mode: str = "k3"
+    # 对应 run_qwen3_8b_fsdp.sh: DISTILLATION_TOPK=64
+    # 仅在 loss_mode=forward_kl_topk 时使用；estimator 模式下（如 k1）忽略
     topk: Optional[int] = 128
+    # 对应 run_qwen3_8b_fsdp.sh: use_task_rewards=False
+    # False 时: 纯蒸馏模式，不使用任务奖励的策略梯度损失（policy_loss = 0）
+    # True  时: 任务奖励与蒸馏损失以 distillation_loss_coef 为权重线性叠加
     use_task_rewards: bool = True
+    # 蒸馏损失权重，仅 use_task_rewards=True 时生效
     distillation_loss_coef: float = 1.0
+    # 对应 run_qwen3_8b_fsdp.sh: loss_max_clamp=10.0
+    # 双向截断蒸馏损失：[-10, 10]，防止梯度爆炸
+    # k1 损失可为负（学生比教师更确信该 token），故需双向截断
     loss_max_clamp: Optional[float] = 10.0
+    # 对应 run_qwen3_8b_fsdp.sh: log_prob_min_clamp=-10.0
+    # 截断 log-prob 下界，避免极小概率 token（log p → -∞）导致数值不稳定
     log_prob_min_clamp: Optional[float] = -10.0
 
+    # 对应 run_qwen3_8b_fsdp.sh: use_policy_gradient=True
+    # True : 将 -KL 作为 advantage 送入策略梯度（OPD 方案，推荐与 k1 配合使用）
+    # False: 直接对蒸馏损失做监督反向传播（SFT 蒸馏，推荐与 k3/forward_kl_topk 配合）
     use_policy_gradient: bool = True
+    # 策略梯度损失函数类型，当前只支持 "vanilla"（标准 PPO clip 损失）
     policy_loss_mode: str = "vanilla"
+    # PPO 裁剪比率，仅 use_policy_gradient=True 时生效
     clip_ratio: float = 0.2
     clip_ratio_low: float = 0.2
     clip_ratio_high: float = 0.2
@@ -89,6 +131,8 @@ class DistillationLossConfig(BaseConfig):
         self._mutable_fields.add("loss_settings")
         from verl.trainer.distillation.losses import DistillationLossSettings, get_distillation_loss_settings
 
+        # 根据 loss_mode 查找注册表，填充运行时设置（use_topk/use_estimator）
+        # 这决定了教师模型推理时是否需要请求 top-k logprobs
         self.loss_settings: DistillationLossSettings = get_distillation_loss_settings(self.loss_mode)
 
         if self.policy_loss_mode != "vanilla":
@@ -97,6 +141,8 @@ class DistillationLossConfig(BaseConfig):
                 f"but got {self.policy_loss_mode}."
             )
 
+        # 警告: forward_kl_topk 与 use_policy_gradient=True 一起使用效果较差
+        # 因为策略梯度只用到采样 token 的 ∇logπ(a)，top-k 的分布信息被浪费
         if self.use_policy_gradient and self.loss_mode == "forward_kl_topk":
             print(
                 "WARNING: forward_kl_topk is most effective as a supervised distillation loss "
@@ -105,6 +151,8 @@ class DistillationLossConfig(BaseConfig):
                 "should move) is largely unused."
             )
 
+        # k1 损失关于模型参数的梯度不依赖教师 log-prob，因此不能直接监督反向传播
+        # run_qwen3_8b_fsdp.sh 中 use_policy_gradient=True，故不触发此错误
         if not self.use_policy_gradient and self.loss_mode == "k1":
             raise ValueError(
                 "Directly backpropagating k1 loss is incorrect since gradient of k1 loss"
@@ -132,9 +180,16 @@ class DistillationTeacherModelConfig(BaseConfig):
 
     _mutable_fields = BaseConfig._mutable_fields | {"num_replicas", "key"}
 
+    # 多教师蒸馏时用于路由样本的标识符（对应 data_source 字段）
+    # 单教师模式（run_qwen3_8b_fsdp.sh）下由 _resolve_teacher_models() 自动填充
     key: Optional[str] = None
+    # 对应 run_qwen3_8b_fsdp.sh: distillation.teacher_models.teacher_model.model_path=Qwen/Qwen3-32B
     model_path: Optional[str] = None
+    # 教师模型推理配置（vLLM 参数，如 tp size、gpu_memory_utilization、max_model_len）
+    # 对应 run_qwen3_8b_fsdp.sh EXTRA 数组中所有 teacher_model.inference.* 字段
     inference: RolloutConfig = field(default_factory=RolloutConfig)
+    # 教师模型副本数，与 per_replica_world_size 的乘积必须等于 n_gpus_per_node * nnodes
+    # run_qwen3_8b_fsdp.sh: teacher_tp=2, TEACHER_WORLD_SIZE=4 → num_replicas=2, per_replica=2
     num_replicas: Optional[int] = 0
 
     @property
@@ -247,25 +302,40 @@ class DistillationConfig(BaseConfig):
 
     _mutable_fields = BaseConfig._mutable_fields | {"teacher_models", "n_gpus_per_node", "nnodes"}
 
+    # 对应 run_qwen3_8b_fsdp.sh: distillation.enabled=True
+    # False 时所有蒸馏相关逻辑均被跳过
     enabled: bool = False
+    # 对应 run_qwen3_8b_fsdp.sh: distillation.n_gpus_per_node=TEACHER_WORLD_SIZE=4
+    # 指教师 GPU 资源池每节点的 GPU 数
     n_gpus_per_node: int = 0
+    # 对应 run_qwen3_8b_fsdp.sh: distillation.nnodes=NNODES=1
     nnodes: int = 0
+    # 对应 run_qwen3_8b_fsdp.sh: distillation.teacher_models.teacher_model.*
+    # 多教师模式下可添加多个教师（如 teacher_model1、teacher_model2）
     teacher_models: dict[str, DistillationTeacherModelConfig] = field(default_factory=dict)
+    # 多教师蒸馏时，用于从样本中读取路由字段名
     teacher_key: str = "data_source"
+    # 蒸馏损失配置，对应 run_qwen3_8b_fsdp.sh: distillation.distillation_loss.*
     distillation_loss: DistillationLossConfig = field(default_factory=DistillationLossConfig)
 
     def __post_init__(self):
         if not self.enabled:
             return
 
+        # 将 OmegaConf DictConfig 子字典解析为 DistillationTeacherModelConfig 实例列表
         self.teacher_models = self._resolve_teacher_models()
         teacher_world_size_sum = 0
         for teacher_model in self.teacher_models.values():
+            # 根据 loss_settings.use_topk 决定教师是否需要返回 top-k logprobs
+            # 同时将 inference.prompt_length 调整为 prompt+response，因为教师需要看到完整上下文
             teacher_model.validate_and_prepare_for_distillation(
                 use_topk=self.distillation_loss.loss_settings.use_topk,
                 topk=self.distillation_loss.topk,
             )
             teacher_world_size_sum += teacher_model.world_size
+        # 校验: 所有教师副本占用的 GPU 总数必须等于 teacher_pool 大小
+        # run_qwen3_8b_fsdp.sh: teacher_tp=2, TEACHER_WORLD_SIZE=4 →
+        #   num_replicas=2 (4/2), per_replica_world_size=2 (tp=2) → world_size=4 = pool_size
         total_pool_size = self.n_gpus_per_node * self.nnodes
         if teacher_world_size_sum != total_pool_size:
             raise ValueError(
