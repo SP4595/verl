@@ -217,25 +217,29 @@ class MemoryOPDPromptRenderer:
             return self.config.legacy_prompt_path
         return self.config.prompt_path
 
-    def _action_protocol(self, task_mode: MemoryTaskMode) -> str:
-        query = (
-            "1. `<query>query 1\\nquery 2\\nquery 3</query>` loads related long-term memories "
-            "into Memory Cache. Put one query per line, with at most "
-            f"{self.config.max_queries_per_action} non-empty lines."
-        )
-        if task_mode == "answer":
-            return f"{query}\n2. `<answer>concise answer</answer>` returns the final answer."
-        if self.config.update_protocol == "replace-cache":
-            update = (
-                "Inside <update>, output the entire desired cache as numbered lines. Every loaded "
-                "item omitted from the list is permanently deleted."
+    def _action_protocol(self, allowed_actions: list[MemoryAction]) -> str:
+        actions: list[str] = []
+        if "query" in allowed_actions:
+            actions.append(
+                "`<query>query 1\\nquery 2\\nquery 3</query>` loads related long-term memories "
+                "into Memory Cache. Put one query per line, with at most "
+                f"{self.config.max_queries_per_action} non-empty lines."
             )
-        else:
-            update = (
-                "Inside <update>, use visible Cache IDs with <replace>, <add>, and <delete> "
-                "operations. Unmentioned loaded items remain unchanged."
-            )
-        return f"{query}\n2. `<update>operations</update>` modifies long-term memory.\n{update}"
+        if "update" in allowed_actions:
+            if self.config.update_protocol == "replace-cache":
+                update = (
+                    "Inside <update>, output the entire desired cache as numbered lines. Every loaded "
+                    "item omitted from the list is permanently deleted."
+                )
+            else:
+                update = (
+                    "Inside <update>, use visible Cache IDs with <replace>, <add>, and <delete> "
+                    "operations. Unmentioned loaded items remain unchanged."
+                )
+            actions.append(f"`<update>operations</update>` modifies long-term memory.\n{update}")
+        if "answer" in allowed_actions:
+            actions.append("`<answer>concise answer</answer>` returns the final answer.")
+        return "\n".join(f"{index}. {action}" for index, action in enumerate(actions, start=1))
 
     def _task_policy(self, task_mode: MemoryTaskMode) -> str:
         path = self.config.update_policy_path if task_mode == "update" else self.config.answer_policy_path
@@ -258,9 +262,7 @@ class MemoryOPDPromptRenderer:
             input=step.current_input,
             query_feedback=step.query_feedback,
             force_instruction=step.force_instruction,
-            task_mode=step.task_mode,
-            allowed_actions=", ".join(step.allowed_actions),
-            action_protocol=self._action_protocol(step.task_mode),
+            action_protocol=self._action_protocol(step.allowed_actions),
             task_policy=self._task_policy(step.task_mode),
         )
         return self._to_messages(prompt)

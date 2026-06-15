@@ -23,8 +23,6 @@ def _write_prompt_config(tmp_path: Path) -> MAgentConfig:
     prompt_path.write_text(
         """
 <system>
-Mode: {% task_mode %}
-Allowed: {% allowed_actions %}
 Protocol: {% action_protocol %}
 Policy: {% task_policy %}
 </system>
@@ -74,6 +72,32 @@ def test_privilege_is_selected_from_sampled_action(tmp_path):
     assert renderer.distillation_scope("query") == "privileged"
     assert renderer.distillation_scope("update") == "privileged"
     assert renderer.distillation_scope("answer") == "normal"
+
+
+def test_prompt_protocol_only_lists_current_step_actions(tmp_path):
+    renderer = MemoryOPDPromptRenderer(_write_prompt_config(tmp_path))
+    normal = MemoryOPDStep(
+        episode_id="locomo-1",
+        phase="qa",
+        task_mode="answer",
+        current_input="Where does Alice live?",
+        allowed_actions=["query", "answer"],
+    )
+    forced = MemoryOPDStep(
+        episode_id="locomo-1",
+        phase="qa",
+        task_mode="answer",
+        current_input="Where does Alice live?",
+        allowed_actions=["answer"],
+    )
+
+    normal_text = str(renderer.render_student_messages(normal))
+    forced_text = str(renderer.render_student_messages(forced))
+
+    assert "loads related long-term memories" in normal_text
+    assert "<answer>concise answer</answer>" in normal_text
+    assert "loads related long-term memories" not in forced_text
+    assert "1. `<answer>concise answer</answer>`" in forced_text
 
 
 def test_parse_memory_action_ignores_thinking_block():
