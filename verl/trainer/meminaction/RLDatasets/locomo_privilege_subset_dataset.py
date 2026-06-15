@@ -26,8 +26,8 @@ from typing import Any
 import torch
 from torch.utils.data import Dataset
 
-from verl.trainer.agentic_trainer.RLDatasets.common import normalize_data_files
-from verl.trainer.agentic_trainer.RLDatasets.schema import validate_memory_episode, validate_sample
+from verl.trainer.meminaction.RLDatasets.common import normalize_data_files
+from verl.trainer.meminaction.RLDatasets.schema import validate_memory_episode, validate_sample
 
 
 class LoCoMoPrivilegeSubsetDataset(Dataset):
@@ -42,6 +42,10 @@ class LoCoMoPrivilegeSubsetDataset(Dataset):
 
     ``tokenizer`` 和 ``processor`` 仅为兼容 VeRL ``create_rl_dataset`` 的固定构造
     签名而保留。动态 prompt 只能在 AgentLoop 中根据当前 Memory Cache token 化。
+
+    该 Dataset 是 episode source，不能直接交给 ``RayPrivilegeOPDTrainer``。正确路径是
+    先把每条 ``memory_episode`` 交给 ``MemoryOPDEpisodeCollector.collect()``，再将
+    collector trace 装入 ``MemoryOPDStepDataset``。
     """
 
     def __init__(
@@ -52,6 +56,8 @@ class LoCoMoPrivilegeSubsetDataset(Dataset):
         processor=None,
         max_samples: int = -1,
     ):
+        # VeRL create_rl_dataset 会无条件传入 tokenizer/processor。这里不能使用它们：
+        # Dataset 尚不知道 rollout 中每一步的动态 Cache，因此任何长度过滤都会失真。
         del tokenizer, processor
         self.config = config
         self.default_data_source = config.get("default_data_source", "locomo_memory_opd")
@@ -95,7 +101,11 @@ class LoCoMoPrivilegeSubsetDataset(Dataset):
 
     @classmethod
     def _build_session(cls, sample: Mapping[str, Any], session_number: int) -> dict[str, Any]:
-        """构造一次 memory 创建任务的输入参数。"""
+        """构造一次 memory 创建任务的输入参数。
+
+        一个 LoCoMo session 会作为一个整体 ``current_input`` 交给 update trajectory。
+        Dataset 只做确定性文本规范化；是否 query、怎样 update 由运行时 controller 决定。
+        """
 
         conversation = sample["conversation"]
         date_time = str(conversation.get(f"session_{session_number}_date_time") or "")
@@ -111,7 +121,11 @@ class LoCoMoPrivilegeSubsetDataset(Dataset):
         }
 
     def _build_qa(self, sample: Mapping[str, Any]) -> list[dict[str, Any]]:
-        """构造 memory 创建完成后依次执行的 QA 任务。"""
+        """构造 memory 创建完成后依次执行的 QA 任务。
+
+        ``answer`` 是评估或后续 reward 所需标签，不会被放进 student prompt。``evidence``
+        同样只作为可追踪元数据保留，不在这里预先注入 Cache。
+        """
 
         rows = []
         for qa_index, qa in enumerate(sample.get("qa", [])):
@@ -130,7 +144,11 @@ class LoCoMoPrivilegeSubsetDataset(Dataset):
         return rows[: self.max_qa]
 
     def _build_row(self, sample: Mapping[str, Any], source_file: str) -> dict[str, Any]:
-        """把一个完整 LoCoMo sample 转换为 episode source。"""
+        """把一个完整 LoCoMo conversation 转换为一条 episode source。
+
+        这里保持“一条 conversation 对应一条 Dataset row”，避免提前展平 QA 后丢失
+        session 写入顺序和共享长期 memory 的语义。
+        """
 
         row_index = len(self.rows)
         sample_id = str(sample.get("sample_id") or f"locomo-{row_index}")
@@ -161,6 +179,7 @@ class LoCoMoPrivilegeSubsetDataset(Dataset):
             "raw_prompt": raw_prompt,
             "data_source": self.default_data_source,
             "reward_model": {},
+            # episode source 尚未产生模型 response，纯 OPD 也不在此阶段计算 reward。
             "extra_info": {
                 "index": row_index,
                 "sample_id": sample_id,
@@ -179,7 +198,11 @@ class LoCoMoPrivilegeSubsetDataset(Dataset):
         return row
 
     def _load_episodes(self, data_files: Any) -> None:
-        """读取 LoCoMo JSON；每个 conversation 保持为一条 episode。"""
+        """读取 LoCoMo JSON；每个 conversation 保持为一条 episode。
+
+        与 RLHFDataset 不同，这里不会应用 chat template、tokenize 或过滤动态 prompt
+        长度。长度限制必须在 ``MemoryOPDStepAgentLoop`` 渲染真实 prompt 后检查。
+        """
 
         from verl.utils.fs import copy_to_local
 

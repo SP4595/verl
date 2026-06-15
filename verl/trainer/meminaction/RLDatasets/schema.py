@@ -1,7 +1,15 @@
-"""Ray Trainer Dataset 的统一样本 schema 与校验逻辑。
+"""Mem-In-Action 到 VeRL Ray Trainer 的数据边界与校验逻辑。
 
 所有放入同一个 VeRL batch 的样本必须拥有一致的顶层 key。Tensor 字段会由
 ``collate_fn`` 堆叠，其他字段会进入 ``DataProto.non_tensor_batch``。
+
+本模块校验两种不同层级的对象：
+
+- ``memory_episode``：Collector 的高层输入，声明 sessions 和 QA；
+- VeRL sample：Dataset ``__getitem__`` 输出，包含 AgentLoop 路由和 batch 兼容字段。
+
+``MemoryOPDStep`` 的动态状态校验位于 ``agentic_loop.py``，因为它同时被 Collector、
+trace 和 AgentLoop 使用，不能与 episode schema 混为一层。
 """
 
 from collections.abc import Mapping
@@ -9,7 +17,10 @@ from typing import Any
 
 import torch
 
-# 每个 BaseDataset 兼容样本都必须返回这些 key。
+# 每个 VeRL 兼容样本都必须返回这些 key。字段会经过默认 collate_fn 分成两类：
+#
+# - dummy_tensor -> DataProto.batch，用来让纯非 tensor 样本仍有可推断 batch size；
+# - 其余字段 -> DataProto.non_tensor_batch，逐样本传递给 AgentLoop/RewardManager。
 #
 # key 存在不代表内容在所有训练模式中都必需。例如纯 OPD 可以返回
 # ``reward_model={}``，但仍应保留该 key，避免混合 batch 的 schema 不一致。
@@ -38,6 +49,15 @@ def validate_memory_episode(episode: Mapping[str, Any]) -> None:
 
     Dataset 只声明需要执行的 session 和 QA；动态 Memory Cache、完整 memory、
     student prompt 和 teacher prompt 都由 rollout 阶段生成。
+
+    顶层字段语义：
+
+    - ``schema_version``：显式版本号，避免旧 trace 被新 Collector 静默误读；
+    - ``episode_id``：跨 session、QA 和 step trace 的稳定身份；
+    - ``source``：原始数据来源，不用于保存 prompt；
+    - ``sessions``：按顺序执行的 memory creation 输入；
+    - ``qa``：全部 session 写入后执行的回答任务；
+    - ``metadata``：只用于追踪和扩展，不参与核心状态机。
     """
 
     required_keys = ("schema_version", "episode_id", "source", "sessions", "qa", "metadata")
@@ -68,6 +88,10 @@ def validate_sample(sample: Mapping[str, Any], require_ground_truth: bool = True
         sample: ``Dataset.__getitem__`` 返回的单条字典。
         require_ground_truth: 是否要求 ``reward_model.ground_truth``。纯 OPD 或
             自定义 RewardManager 可以关闭；默认规则 RewardManager 通常必须开启。
+
+    ``raw_prompt`` 在普通静态 Dataset 中是真实 prompt；在 Memory episode/step Dataset
+    中只是 VeRL 公共管道要求的非空兼容字段。校验器只验证其结构，无法判断它是否会被
+    当前 AgentLoop 用于模型输入。
     """
 
     missing_keys = [key for key in NORMALIZED_SAMPLE_KEYS if key not in sample]

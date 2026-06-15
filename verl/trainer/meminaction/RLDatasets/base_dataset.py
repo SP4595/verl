@@ -1,4 +1,4 @@
-"""VeRL Ray Trainer 的基础 Dataset。
+"""静态 prompt 任务使用的 VeRL Ray Trainer 基础 Dataset。
 
 原始 JSON/JSONL/Parquet 推荐每行至少包含::
 
@@ -11,23 +11,28 @@
 
 ``reward_model`` 是奖励计算元数据，不是神经网络 Reward Model。纯 OPD 或自定义
 RewardManager 可以省略其内容，但同一个 batch 中仍应保留 ``reward_model`` key。
+
+此类继承 VeRL ``RLHFDataset``，适合 prompt 在读取数据时已经确定的普通单轮任务。
+它会使用传入 tokenizer 做 prompt 长度过滤。Mem-In-Action 的 ``memory_episode`` 和
+``memory_step`` prompt 会随 Cache 状态变化，不应继承此类；对应 Dataset 只保留
+``tokenizer`` 构造参数以兼容 VeRL 工厂，并在 AgentLoop 中完成真正 tokenization。
 """
 
 from typing import Any
 
 import torch
 
-from verl.trainer.agentic_trainer.RLDatasets.schema import validate_sample
+from verl.trainer.meminaction.RLDatasets.schema import validate_sample
 from verl.utils.dataset.rl_dataset import RLHFDataset
 
 
 class BaseDataset(RLHFDataset):
     """规范化 VeRL Dataset 输出，并提供单条样本转换扩展点。
 
-    构造函数必须保持以下 VeRL Dataset API：
+    构造函数必须保持以下 VeRL Dataset 工厂 API：
 
     - ``data_files``：训练或验证文件路径；
-    - ``tokenizer``：Actor tokenizer；
+    - ``tokenizer``：Actor tokenizer；本静态 Dataset 会用它做长度过滤；
     - ``config``：``config.data``；
     - ``processor``：可选多模态 processor；
     - ``max_samples``：最多加载的样本数。
@@ -46,6 +51,10 @@ class BaseDataset(RLHFDataset):
     子类通常只需重写 :meth:`transform_sample`。不要在 Dataset 中生成
     ``responses``、``teacher_logprobs``、``rm_scores`` 或 ``advantages``，
     这些字段由 Trainer 和 AgentLoop 在训练阶段生成。
+
+    注意：此类的 ``raw_prompt`` 是真实静态 prompt。与之不同，
+    ``LoCoMoPrivilegeSubsetDataset`` 和 ``MemoryOPDStepDataset`` 中的 ``raw_prompt``
+    只是 VeRL 兼容占位，真实 prompt 由 ``MemoryOPDStepAgentLoop`` 动态生成。
     """
 
     def __init__(
@@ -63,6 +72,7 @@ class BaseDataset(RLHFDataset):
         self.validate_custom_sample = config.get("validate_custom_sample", True)
 
         # 复用 RLHFDataset 完成文件加载、长度过滤、多模态处理和恢复逻辑。
+        # 这里 tokenizer 是真实依赖；只有静态 prompt 才能在 Dataset 阶段正确量长度。
         super().__init__(
             data_files=data_files,
             tokenizer=tokenizer,
@@ -72,7 +82,11 @@ class BaseDataset(RLHFDataset):
         )
 
     def __getitem__(self, item: int) -> dict[str, Any]:
-        """返回一条可直接交给 VeRL 默认 ``collate_fn`` 的样本。"""
+        """返回一条可直接交给 VeRL 默认 ``collate_fn`` 的规范化样本。
+
+        Tensor 字段将被堆叠到 ``DataProto.batch``，普通 Python 字段会进入
+        ``DataProto.non_tensor_batch``，之后逐样本转发给对应 AgentLoop。
+        """
 
         # RLHFDataset 在这里生成 raw_prompt、dummy_tensor 等基础字段。
         sample = dict(super().__getitem__(item))

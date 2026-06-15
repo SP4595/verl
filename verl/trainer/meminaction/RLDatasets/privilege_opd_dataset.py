@@ -1,8 +1,12 @@
-"""多个异构 source 组成的 Memory-OPD 输入 Dataset。
+"""多个异构 source 组成的统一 VeRL Dataset 组合器。
 
 LoCoMo 等长轨迹来源应输出 ``memory_episode``，再由 Agentic Collector 展开为
 single-turn ``memory_step``。不要把 episode source 与已经展开的 step source 放进
 同一个 Trainer batch。
+
+该组合器只解决“多个数据来源如何采样并暴露一致顶层 key”，不解决状态推进。组合
+episode source 时，消费者必须是 Collector；组合 step source 时，消费者才可以是
+``RayPrivilegeOPDTrainer``。配置者必须保证同一个 batch 中所有 subset 位于同一阶段。
 """
 
 import copy
@@ -13,13 +17,13 @@ from typing import Any
 from omegaconf import OmegaConf
 from torch.utils.data import Dataset
 
-from verl.trainer.agentic_trainer.RLDatasets.base_dataset import BaseDataset
-from verl.trainer.agentic_trainer.RLDatasets.common import infer_dataset_split, to_plain_container
-from verl.trainer.agentic_trainer.RLDatasets.locomo_privilege_subset_dataset import (
+from verl.trainer.meminaction.RLDatasets.base_dataset import BaseDataset
+from verl.trainer.meminaction.RLDatasets.common import infer_dataset_split, to_plain_container
+from verl.trainer.meminaction.RLDatasets.locomo_privilege_subset_dataset import (
     LoCoMoPrivilegeSubsetDataset,
 )
-from verl.trainer.agentic_trainer.RLDatasets.memory_opd_step_dataset import MemoryOPDStepDataset
-from verl.trainer.agentic_trainer.RLDatasets.schema import PRIVILEGE_OPD_SAMPLE_KEYS, validate_sample
+from verl.trainer.meminaction.RLDatasets.memory_opd_step_dataset import MemoryOPDStepDataset
+from verl.trainer.meminaction.RLDatasets.schema import PRIVILEGE_OPD_SAMPLE_KEYS, validate_sample
 from verl.utils.import_utils import load_extern_object
 
 # 这些配置只由组合 Dataset 使用，不应继续传给子 Dataset。
@@ -105,6 +109,11 @@ class PrivilegeOPDDataset(Dataset):
 
     该类只负责组合数据来源。完整 memory、Memory Cache、student prompt 和
     privileged teacher prompt 均由 rollout/AgentLoop 动态构造。
+
+    ``shared_fields`` 是混合异构 subset 时最关键的配置：默认 ``collate_fn`` 按 key
+    收集值，如果不同样本顶层 key 不一致，batch 长度和逐样本字段会错位。因此每个
+    Trainer batch 使用到的额外字段都应声明为 shared field，例如 step 训练声明
+    ``shared_fields: [memory_step]``。
     """
 
     def __init__(
@@ -115,6 +124,8 @@ class PrivilegeOPDDataset(Dataset):
         processor=None,
         max_samples: int = -1,
     ):
+        # 组合器自身不 tokenize，但必须把同一个 tokenizer/processor 继续传给子类。
+        # 静态 BaseDataset 会真实使用 tokenizer；Memory episode/step Dataset 会忽略它。
         self.config = config
         self.tokenizer = tokenizer
         self.processor = processor
@@ -166,7 +177,11 @@ class PrivilegeOPDDataset(Dataset):
         raise TypeError("config.data.subsets 必须是 mapping 或 list")
 
     def _resolve_subset_dataset_cls(self, subset_name: str, spec: Mapping[str, Any]) -> type[Dataset]:
-        """解析当前 subset 使用的 Dataset 类。"""
+        """解析当前 subset 使用的 Dataset 类。
+
+        内置类按名称解析；外部类必须提供文件路径和类名。这里仅检查其继承自 PyTorch
+        Dataset，具体样本契约会在 ``__getitem__`` 时通过 ``validate_sample`` 校验。
+        """
 
         dataset_cls_config = spec.get("dataset_cls") or {}
         if isinstance(dataset_cls_config, str):
@@ -198,7 +213,11 @@ class PrivilegeOPDDataset(Dataset):
         return dataset_cls
 
     def _build_child_config(self, subset_name: str, spec: Mapping[str, Any]):
-        """继承顶层 data 配置，并合并当前 subset 的 config 覆盖项。"""
+        """继承顶层 data 配置，并合并当前 subset 的局部覆盖项。
+
+        组合器专属字段必须先移除，尤其是 ``custom_cls``，否则子 Dataset 可能再次解析
+        到组合器自身并发生递归构造。
+        """
 
         base_config = dict(to_plain_container(self.config))
         for key in _COMPOSITE_CONFIG_KEYS:
@@ -223,7 +242,7 @@ class PrivilegeOPDDataset(Dataset):
         return subset_files
 
     def _build_subsets(self) -> None:
-        """实例化所有异构子 Dataset。"""
+        """实例化所有异构子 Dataset，并保持配置顺序作为稳定 subset 顺序。"""
 
         for subset_name, spec in self._iter_subset_specs():
             dataset_cls = self._resolve_subset_dataset_cls(subset_name, spec)
@@ -246,7 +265,12 @@ class PrivilegeOPDDataset(Dataset):
             self.subset_specs.append(spec)
 
     def _build_index_map(self, max_samples: int) -> list[tuple[int, int]]:
-        """构建全局 index 到 ``(subset_index, local_index)`` 的确定性映射。"""
+        """构建全局 index 到 ``(subset_index, local_index)`` 的确定性映射。
+
+        ``concat``/``round_robin`` 不重复样本；``weighted`` 按权重有放回采样，因此同一
+        local sample 可以在一个 epoch 中出现多次。映射在构造或 resume 时一次生成，
+        使 ``__getitem__`` 不依赖运行时随机状态。
+        """
 
         sampling_config = dict(to_plain_container(self.config.get("subset_sampling", {})) or {})
         strategy = sampling_config.get(f"{self.split}_strategy", sampling_config.get("strategy", "concat"))
@@ -299,7 +323,11 @@ class PrivilegeOPDDataset(Dataset):
         return len(self._index_map)
 
     def __getitem__(self, item: int) -> dict[str, Any]:
-        """读取任意 subset 样本，并投影为统一 Privileged OPD API。"""
+        """读取任意 subset 样本，并投影为统一 VeRL batch API。
+
+        投影只统一顶层 key 和来源索引，不会把 episode 转换成 step，也不会构造
+        student/teacher prompt。
+        """
 
         if item < 0:
             item += len(self)
@@ -342,6 +370,8 @@ class PrivilegeOPDDataset(Dataset):
                 sample[field] = copy.deepcopy(self.shared_field_defaults.get(field))
 
         if not self.preserve_source_fields:
+            # 丢弃未声明的源私有字段，确保 batch 中每条样本键集合一致。需要进入
+            # AgentLoop/Trainer 的扩展字段必须显式加入 shared_fields。
             output_keys = PRIVILEGE_OPD_SAMPLE_KEYS + self.shared_fields
             sample = {key: sample[key] for key in output_keys}
 

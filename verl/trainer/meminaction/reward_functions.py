@@ -1,4 +1,12 @@
-"""可直接交给 VeRL RewardManager 的基础 reward function 模板。"""
+"""可直接交给 VeRL RewardManager 的普通答案 reward function 模板。
+
+当前 ``RayPrivilegeOPDTrainer`` 是纯 OPD，配置会明确禁止 Reward Model 和任务 reward，
+因此它不会调用本模块。保留这些函数是为了普通 RL/评估阶段或未来在 answer step 上
+启用任务 reward；它们不评价 query/update 对 Memory 状态造成的长期影响。
+
+真正的 Memory-RL reward 需要接收动作执行后的环境状态或未来 QA 结果，不能只依赖这里
+的 ``solution_str`` 和 ``ground_truth`` 接口。
+"""
 
 import math
 import re
@@ -14,7 +22,11 @@ def _normalize_answer(value: Any) -> str:
 
 
 def _extract_final_answer(solution_str: str) -> tuple[str, bool]:
-    """提取最终答案，并返回是否命中推荐格式。"""
+    """提取最终答案，并返回是否命中推荐格式。
+
+    按明确格式优先级查找，若都未命中则回退到最后一个非空行。回退答案可以参与正确性
+    判断，但不会获得 ``format_score``。
+    """
 
     text = solution_str.strip()
     patterns = (
@@ -32,12 +44,16 @@ def _extract_final_answer(solution_str: str) -> tuple[str, bool]:
 
 
 def _iter_ground_truths(ground_truth: Any) -> Iterable[Any]:
+    """把单个答案或多个可接受答案统一成可迭代对象。"""
+
     if isinstance(ground_truth, (list, tuple, set)):
         return ground_truth
     return (ground_truth,)
 
 
 def _is_correct(prediction: str, ground_truth: Any, numeric_tolerance: float | None) -> bool:
+    """执行规范化 exact match，并可选允许绝对数值误差。"""
+
     normalized_prediction = _normalize_answer(prediction)
     for candidate in _iter_ground_truths(ground_truth):
         if normalized_prediction == _normalize_answer(candidate):
@@ -70,6 +86,9 @@ def compute_score(
 
     实际多任务项目通常应按 ``data_source`` 分发到数学、代码、工具调用等任务
     专属 verifier。返回字典至少包含 ``score``。
+
+    参数 ``extra_info`` 可为单条样本覆盖 ``numeric_tolerance``。额外 ``kwargs`` 被
+    接受并忽略，以兼容 VeRL RewardManager 在不同版本中传入的扩展参数。
     """
 
     del kwargs
@@ -98,7 +117,11 @@ def compute_score_batched(
     extra_infos: Iterable[dict[str, Any]],
     **kwargs: Any,
 ) -> list[dict[str, float]]:
-    """批量 RewardManager 使用的 reward function。"""
+    """批量 RewardManager 使用的 reward function。
+
+    ``strict=True`` 会在各字段长度不一致时立即报错，避免 zip 静默截断导致部分样本
+    没有 reward。
+    """
 
     return [
         compute_score(
