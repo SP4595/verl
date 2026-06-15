@@ -58,7 +58,9 @@ class LoCoMoPrivilegeSubsetDataset(Dataset):
     ):
         # VeRL create_rl_dataset 会无条件传入 tokenizer/processor。这里不能使用它们：
         # Dataset 尚不知道 rollout 中每一步的动态 Cache，因此任何长度过滤都会失真。
+        # 步骤 1：丢弃只为 VeRL 工厂签名兼容而传入的 tokenizer/processor。
         del tokenizer, processor
+        # 步骤 2：读取 LoCoMo 过滤、截断、校验和 AgentLoop 路由配置。
         self.config = config
         self.default_data_source = config.get("default_data_source", "locomo_memory_opd")
         self.default_agent_name = config.get("default_agent_name", "memory_opd_episode")
@@ -67,9 +69,11 @@ class LoCoMoPrivilegeSubsetDataset(Dataset):
         self.max_qa = config.get("locomo_max_qa")
         self.validate_custom_sample = config.get("validate_custom_sample", True)
 
+        # 步骤 3：从所有源文件加载并规范化完整 episode。
         self.rows: list[dict[str, Any]] = []
         self._load_episodes(data_files)
 
+        # 步骤 4：按配置确定性 shuffle，并在 episode 粒度应用 max_samples。
         if config.get("shuffle", False):
             rng = random.Random(config.get("seed", 0) or 0)
             rng.shuffle(self.rows)
@@ -80,19 +84,24 @@ class LoCoMoPrivilegeSubsetDataset(Dataset):
     def _render_turn(turn: Mapping[str, Any]) -> str:
         """渲染单轮对话，并保留 speaker、dia_id 和图片描述。"""
 
+        # 步骤 1：提取说话人、轮次 ID 和可用文本。
         speaker = turn.get("speaker", "Unknown")
         dia_id = turn.get("dia_id", "?")
         text = str(turn.get("text") or turn.get("clean_text") or "").strip()
         caption = str(turn.get("blip_caption") or "").strip()
+        # 步骤 2：存在图片描述时追加到文本，保留多模态语义的文本替代。
         if caption:
             text = f"{text} [Image: {caption}]".strip()
+        # 步骤 3：生成稳定、可读的单轮文本。
         return f"{speaker} ({dia_id}): {text}"
 
     @staticmethod
     def _session_numbers(sample: Mapping[str, Any]) -> list[int]:
         """返回 conversation 中真正的 session 编号，跳过日期字段。"""
 
+        # 步骤 1：扫描 conversation 中符合 session_N 的键，自动跳过日期键等辅助字段。
         conversation = sample["conversation"]
+        # 步骤 2：转换为整数并排序，恢复真实时间顺序。
         return sorted(
             int(match.group(1))
             for key in conversation
@@ -107,11 +116,14 @@ class LoCoMoPrivilegeSubsetDataset(Dataset):
         Dataset 只做确定性文本规范化；是否 query、怎样 update 由运行时 controller 决定。
         """
 
+        # 步骤 1：读取当前 session 的日期和原始 turns。
         conversation = sample["conversation"]
         date_time = str(conversation.get(f"session_{session_number}_date_time") or "")
         turns = conversation[f"session_{session_number}"]
+        # 步骤 2：将所有 turns 渲染为一个 update task 的 current_input。
         rendered_turns = "\n".join(cls._render_turn(turn) for turn in turns)
         chunk = f"Date: {date_time}\n{rendered_turns}".strip()
+        # 步骤 3：保留原始 turns 作为追踪元数据，但 prompt 只使用 input。
         return {
             "session_index": session_number,
             "date_time": date_time,
@@ -127,11 +139,14 @@ class LoCoMoPrivilegeSubsetDataset(Dataset):
         同样只作为可追踪元数据保留，不在这里预先注入 Cache。
         """
 
+        # 步骤 1：准备按原始顺序保存 QA task。
         rows = []
         for qa_index, qa in enumerate(sample.get("qa", [])):
+            # 步骤 2：按配置过滤不参与训练的 LoCoMo category。
             category = int(qa.get("category", 0))
             if self.skip_category_5 and category == 5:
                 continue
+            # 步骤 3：保留问题、标签和 evidence，但不提前构造 answer prompt。
             rows.append(
                 {
                     "qa_index": qa_index,
@@ -141,6 +156,7 @@ class LoCoMoPrivilegeSubsetDataset(Dataset):
                     "evidence": copy.deepcopy(qa.get("evidence", [])),
                 }
             )
+        # 步骤 4：在 QA 粒度应用可选数量上限。
         return rows[: self.max_qa]
 
     def _build_row(self, sample: Mapping[str, Any], source_file: str) -> dict[str, Any]:
@@ -150,8 +166,10 @@ class LoCoMoPrivilegeSubsetDataset(Dataset):
         session 写入顺序和共享长期 memory 的语义。
         """
 
+        # 步骤 1：确定当前 episode 的全局 row index 和稳定 episode_id。
         row_index = len(self.rows)
         sample_id = str(sample.get("sample_id") or f"locomo-{row_index}")
+        # 步骤 2：发现并截断 session，然后构造完整 memory_episode。
         session_numbers = self._session_numbers(sample)[: self.max_sessions]
         memory_episode = {
             "schema_version": 1,
@@ -164,16 +182,19 @@ class LoCoMoPrivilegeSubsetDataset(Dataset):
                 "sample_id": sample_id,
             },
         }
+        # 步骤 3：在创建 VeRL wrapper 前校验 Collector 所需的 episode 契约。
         validate_memory_episode(memory_episode)
 
         # VeRL 当前 Dataset/AgentLoop 管道要求 raw_prompt 非空。这里仅放一个可读的
         # episode 启动标记；真正的每步 prompt 由 MemoryOPDPromptRenderer 生成。
+        # 步骤 4：创建只供 VeRL 公共管道使用的占位 raw_prompt。
         raw_prompt = [
             {
                 "role": "user",
                 "content": f"Run Memory-OPD episode {sample_id}.",
             }
         ]
+        # 步骤 5：包装 AgentLoop 路由、追踪字段、dummy tensor 和真实 memory_episode。
         row = {
             "prompt": copy.deepcopy(raw_prompt),
             "raw_prompt": raw_prompt,
@@ -193,8 +214,10 @@ class LoCoMoPrivilegeSubsetDataset(Dataset):
             "dummy_tensor": torch.tensor([0], dtype=torch.uint8),
             "memory_episode": memory_episode,
         }
+        # 步骤 6：校验 VeRL wrapper 契约；episode source 不要求 ground truth。
         if self.validate_custom_sample:
             validate_sample(row, require_ground_truth=False)
+        # 步骤 7：返回一条完整 conversation 粒度的 episode source。
         return row
 
     def _load_episodes(self, data_files: Any) -> None:
@@ -206,17 +229,22 @@ class LoCoMoPrivilegeSubsetDataset(Dataset):
 
         from verl.utils.fs import copy_to_local
 
+        # 步骤 1：规范化所有配置路径，并逐文件复制到本地缓存。
         for data_file in normalize_data_files(data_files):
             local_file = copy_to_local(src=data_file, cache_dir=self.config.get("cache_dir"))
+            # 步骤 2：解析 JSON 顶层单对象或对象列表。
             payload = json.loads(Path(local_file).read_text(encoding="utf-8"))
             samples = payload if isinstance(payload, list) else [payload]
+            # 步骤 3：每个 conversation 构造一条 episode row。
             for sample in samples:
                 self.rows.append(self._build_row(sample, source_file=str(data_file)))
 
     def __len__(self) -> int:
+        # 步骤 1：Dataset 长度等于完整 conversation/episode 数量。
         return len(self.rows)
 
     def __getitem__(self, item: int) -> dict[str, Any]:
+        # 步骤 1：返回深拷贝，防止 Collector 或 collate 修改缓存中的原始 episode。
         return copy.deepcopy(self.rows[item])
 
 

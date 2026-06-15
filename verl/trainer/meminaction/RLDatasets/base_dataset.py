@@ -65,6 +65,7 @@ class BaseDataset(RLHFDataset):
         processor=None,
         max_samples: int = -1,
     ):
+        # 步骤 1：读取所有样本规范化和校验默认值。
         self.default_data_source = config.get("default_data_source", "custom")
         self.default_agent_name = config.get("default_agent_name", "single_turn_agent")
         self.default_reward_style = config.get("default_reward_style", "rule")
@@ -73,6 +74,7 @@ class BaseDataset(RLHFDataset):
 
         # 复用 RLHFDataset 完成文件加载、长度过滤、多模态处理和恢复逻辑。
         # 这里 tokenizer 是真实依赖；只有静态 prompt 才能在 Dataset 阶段正确量长度。
+        # 步骤 2：交给 RLHFDataset 下载、读取、静态 prompt 长度过滤并建立 dataframe。
         super().__init__(
             data_files=data_files,
             tokenizer=tokenizer,
@@ -89,19 +91,23 @@ class BaseDataset(RLHFDataset):
         """
 
         # RLHFDataset 在这里生成 raw_prompt、dummy_tensor 等基础字段。
+        # 步骤 1：让 RLHFDataset 读取原始行并生成 raw_prompt 等 VeRL 基础字段。
         sample = dict(super().__getitem__(item))
 
         # 复制字典，避免后续修改污染 Hugging Face Dataset 中的原始对象。
+        # 步骤 2：规范化追踪信息和稳定样本 index。
         extra_info = dict(sample.get("extra_info") or {})
         extra_info.setdefault("index", item)
         sample["extra_info"] = extra_info
         sample["index"] = extra_info["index"]
 
         # data_source 应保持低基数和稳定，用于任务、reward 或 teacher 路由。
+        # 步骤 3：补齐低基数 data_source，供 reward/teacher 路由。
         sample["data_source"] = sample.get("data_source") or self.default_data_source
 
         # 默认 RewardManager 会读取 reward_model["ground_truth"]。如果原始数据
         # 将答案放在 extra_info 中，这里提供兼容补齐。
+        # 步骤 4：规范化 reward 元数据，并从 extra_info 兼容补齐 ground truth。
         reward_model = dict(sample.get("reward_model") or {})
         if "ground_truth" not in reward_model:
             ground_truth = extra_info.get("ground_truth", extra_info.get("answer"))
@@ -111,6 +117,7 @@ class BaseDataset(RLHFDataset):
             reward_model.setdefault("style", self.default_reward_style)
         sample["reward_model"] = reward_model
 
+        # 步骤 5：补齐 AgentLoop 路由、工具参数和交互参数。
         sample["agent_name"] = sample.get("agent_name") or self.default_agent_name
         sample["tools_kwargs"] = dict(sample.get("tools_kwargs") or extra_info.get("tools_kwargs") or {})
         sample["interaction_kwargs"] = dict(
@@ -118,14 +125,18 @@ class BaseDataset(RLHFDataset):
         )
 
         # 当前 DataProto 要求 Dataset batch 至少包含一个 Tensor 字段。
+        # 步骤 6：确保 DataProto.batch 至少包含一个 Tensor，从而可以推断 batch size。
         sample.setdefault("dummy_tensor", torch.tensor([0], dtype=torch.uint8))
 
+        # 步骤 7：调用子类扩展点，允许在统一字段准备完成后追加任务特有字段。
         sample = self.transform_sample(sample=sample, item=item)
         if not isinstance(sample, dict):
             raise TypeError(f"transform_sample 必须返回 dict，实际返回 {type(sample)!r}")
 
+        # 步骤 8：在样本进入 collate_fn 前执行最终公共契约校验。
         if self.validate_custom_sample:
             validate_sample(sample, require_ground_truth=self.require_ground_truth)
+        # 步骤 9：返回可直接被默认 collate_fn 批处理的字典。
         return sample
 
     def transform_sample(self, sample: dict[str, Any], item: int) -> dict[str, Any]:
@@ -135,11 +146,13 @@ class BaseDataset(RLHFDataset):
         模板应用和 tokenization 应由 AgentLoop 完成。
         """
 
+        # 步骤 1：基础实现不改变样本；子类可覆盖此方法。
         return sample
 
     def on_batch_end(self, batch) -> None:
         """训练 batch 完成后的可选回调，用于在线数据或 curriculum learning。"""
 
+        # 步骤 1：基础静态 Dataset 无需响应训练结果；在线 Dataset 可覆盖此回调。
         return None
 
 
