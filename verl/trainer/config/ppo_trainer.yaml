@@ -112,6 +112,9 @@ algorithm:
 # config for the trainer
 trainer:
 
+  # Optional fully-qualified custom Ray trainer class
+  trainer_class: null
+
   # Whether to balance batch sizes across distributed workers
   balance_batch: True
 

@@ -236,6 +236,12 @@ agent:
   # default agent loop to use if `agent_name` not set in RL dataset
   default_agent_loop: single_turn_agent
 
+  # Optional fully-qualified custom AgentLoopManager class
+  agent_loop_manager_class: null
+
+  # Global Mem-In-Action prompt paths and controller settings
+  memory_opd_prompt: {}
+
   # custom agent loop config path, which should contain list of configs to initialize AgentLoop instances.
   # https://hydra.cc/docs/advanced/instantiate_objects/overview/
   #

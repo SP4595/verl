@@ -278,12 +278,12 @@ def distillation_ppo_loss(
     distillation_loss_config = distillation_config.distillation_loss
     # 计算聚合蒸馏损失标量
     distill_loss, distill_metrics = distillation_loss(config, distillation_config, model_output, data)
-    # 计算 PPO 策略梯度 loss（仅在 use_task_rewards=True 时使用）
-    policy_loss, policy_metrics = ppo_loss(config, model_output, data, dp_group)
-    if not distillation_loss_config.use_task_rewards:
-        # run_qwen3_8b_fsdp.sh: use_task_rewards=False
-        # 纯蒸馏模式：丢弃基于任务奖励的策略梯度损失
-        policy_loss = 0.0
+    # 只有混合任务 reward 时才计算 PPO loss。纯 OPD batch 不包含 advantages，
+    # 无条件调用 ppo_loss 不仅浪费计算，还会错误要求 reward/advantage 字段存在。
+    if distillation_loss_config.use_task_rewards:
+        policy_loss, policy_metrics = ppo_loss(config, model_output, data, dp_group)
+    else:
+        policy_loss, policy_metrics = 0.0, {}
 
     # 合并蒸馏损失与策略损失
     policy_metrics.update(distill_metrics)

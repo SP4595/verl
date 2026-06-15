@@ -95,6 +95,8 @@ class AgentLoopConfig(BaseConfig):
     # Fully qualified class name for custom AgentLoopManager (e.g., "mypackage.module.MyManager").
     # Security: This class will be dynamically imported via importlib. Only use trusted class paths.
     agent_loop_manager_class: Optional[str] = None
+    # Global Mem-In-Action prompt paths and controller settings; never stored per Dataset sample.
+    memory_opd_prompt: dict = field(default_factory=dict)
 
 
 @dataclass

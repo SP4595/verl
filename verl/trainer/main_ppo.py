@@ -44,7 +44,7 @@ from verl.trainer.ppo.ray_trainer import RayPPOTrainer
 from verl.trainer.ppo.utils import need_critic, need_reference_policy
 from verl.utils.config import validate_config
 from verl.utils.device import auto_set_device, is_cuda_available
-from verl.utils.import_utils import deprecated
+from verl.utils.import_utils import deprecated, load_class_from_fqn
 
 
 @deprecated(
@@ -379,8 +379,15 @@ class TaskRunner:
         # data.shuffle=False 时使用 SequentialSampler，保证 checkpoint 可精确恢复
         train_sampler = create_rl_sampler(config.data, train_dataset)
 
-        # 实例化 RayPPOTrainer，将所有组件（Worker 映射、资源池、数据集）组装在一起
-        trainer = RayPPOTrainer(
+        # 默认使用标准 PPO Trainer；Memory-OPD 等特殊数据流可以通过 FQN 选择薄封装，
+        # 避免复制或继续修改通用 TaskRunner。
+        trainer_class_fqn = config.trainer.get("trainer_class")
+        trainer_cls = (
+            load_class_from_fqn(trainer_class_fqn, "Ray trainer")
+            if trainer_class_fqn
+            else RayPPOTrainer
+        )
+        trainer = trainer_cls(
             config=config,
             tokenizer=tokenizer,
             processor=processor,
