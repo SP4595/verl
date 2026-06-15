@@ -85,8 +85,11 @@ def parse_memory_action(text: str) -> tuple[str | None, str]:
     :meth:`MemoryOPDEpisodeCollector._collect_task` 完成。
     """
 
+    # 步骤 1：移除不可执行的思考内容，只保留模型最终公开输出。
     visible_text = _THINK_PATTERN.sub("", text).strip()
+    # 步骤 2：在公开输出中查找第一个完整闭合的 Memory action tag。
     match = _ACTION_PATTERN.search(visible_text)
+    # 步骤 3：规范化 action 名称并返回 payload；未命中时显式返回无效动作。
     return (match.group(1).lower(), match.group(2).strip()) if match else (None, "")
 
 
@@ -100,8 +103,10 @@ def iter_memory_episode_tasks(memory_episode: Mapping[str, Any]):
     ``sessions`` 和 ``qa`` 统一投影成 Collector 可以消费的 task 参数。
     """
 
+    # 步骤 1：先验证 episode 契约，避免执行到一半才发现 session/QA 结构损坏。
     validate_memory_episode(memory_episode)
     episode_id = memory_episode["episode_id"]
+    # 步骤 2：先把所有 session 转换为 update task，按时间顺序写入长期 memory。
     for session in memory_episode["sessions"]:
         yield {
             "episode_id": episode_id,
@@ -113,6 +118,7 @@ def iter_memory_episode_tasks(memory_episode: Mapping[str, Any]):
                 "date_time": session.get("date_time", ""),
             },
         }
+    # 步骤 3：session 全部完成后，再把 QA 转换为 answer task，共享同一长期 memory。
     for qa in memory_episode["qa"]:
         yield {
             "episode_id": episode_id,
@@ -126,10 +132,13 @@ def iter_memory_episode_tasks(memory_episode: Mapping[str, Any]):
 def _memory_content(row: Any) -> str:
     """从普通字典或 Mem-In-Action MemoryItem 中读取可渲染文本。"""
 
+    # 步骤 1：兼容已经是纯文本的 memory row。
     if isinstance(row, str):
         return row.strip()
+    # 步骤 2：兼容经过 Ray/JSON 序列化后的普通字典。
     if isinstance(row, Mapping):
         return str(row.get("content") or row.get("text") or "").strip()
+    # 步骤 3：最后兼容 Mem-In-Action 自定义 MemoryItem 对象。
     return str(getattr(row, "content", "") or "").strip()
 
 
@@ -140,15 +149,18 @@ def _render_cache(rows: list[Any]) -> str:
     当前 Cache 中可用于 update 操作的可见 ID，不能替换为 teacher-only memory ID。
     """
 
+    # 步骤 1：空 Cache 使用稳定占位文本，避免模板字段为空导致语义不明确。
     if not rows:
         return "(empty memory cache)"
     lines = []
+    # 步骤 2：逐条提取 student 可见内容和当前 Cache vid。
     for index, row in enumerate(rows, start=1):
         content = _memory_content(row)
         if not content:
             continue
         vid = row.get("vid", index) if isinstance(row, Mapping) else getattr(row, "vid", index)
         lines.append(f"[{vid}] {content}")
+    # 步骤 3：拼接为 prompt 文本；全是空内容时仍返回空 Cache 占位。
     return "\n".join(lines) or "(empty memory cache)"
 
 
@@ -159,9 +171,11 @@ def _render_full_memory(rows: list[Any]) -> str:
     可见的 action 协议输出 query，或使用 Cache 中可见的 vid 执行 update。
     """
 
+    # 步骤 1：完整 memory 为空时向 teacher 明确说明当前全局状态。
     if not rows:
         return "(complete memory is empty)"
     lines = []
+    # 步骤 2：逐条提取内容，并优先使用长期 memory 的稳定 ID。
     for index, row in enumerate(rows, start=1):
         content = _memory_content(row)
         if not content:
@@ -171,6 +185,7 @@ def _render_full_memory(rows: list[Any]) -> str:
         else:
             memory_id = getattr(row, "memory_id", None) or getattr(row, "rid", None) or f"m{index:06d}"
         lines.append(f"[{memory_id}] {content}")
+    # 步骤 3：生成只允许进入 privileged teacher prompt 的完整 memory 文本。
     return "\n".join(lines) or "(complete memory is empty)"
 
 
@@ -182,7 +197,9 @@ def _serialize_memory_rows(rows: list[Any]) -> list[dict[str, Any]]:
     Python 基础容器，不把活跃 Memory 对象本身送入 Dataset。
     """
 
+    # 步骤 1：创建独立列表，保证快照与活跃 Memory 环境解除引用关系。
     serialized = []
+    # 步骤 2：逐条将字典或对象转换为仅含基础 Python 类型的记录。
     for row in rows:
         if isinstance(row, Mapping):
             serialized.append(copy.deepcopy(dict(row)))
@@ -196,6 +213,7 @@ def _serialize_memory_rows(rows: list[Any]) -> list[dict[str, Any]]:
                 "metadata": copy.deepcopy(getattr(row, "metadata", {}) or {}),
             }
         )
+    # 步骤 3：返回可安全进入 Ray、DataLoader 和 JSON trace 的快照。
     return serialized
 
 
@@ -236,14 +254,19 @@ class MemoryOPDStep:
     def __post_init__(self) -> None:
         """在 step 离开 Collector 前验证动作空间与任务模式的一致性。"""
 
+        # 步骤 1：验证 task_mode，决定该 trajectory 最终必须 update 还是 answer。
         if self.task_mode not in {"update", "answer"}:
             raise ValueError(f"未知 task_mode: {self.task_mode!r}")
+        # 步骤 2：验证高层阶段，区分 memory creation 和 QA。
         if self.phase not in {"memory_creation", "qa"}:
             raise ValueError(f"未知 phase: {self.phase!r}")
+        # 步骤 3：拒绝无法构造有效 prompt 的空输入。
         if not self.current_input.strip():
             raise ValueError("MemoryOPDStep.current_input 不能为空")
+        # 步骤 4：调用方未指定动作空间时，默认允许 query 后执行当前 terminal action。
         if not self.allowed_actions:
             self.allowed_actions = ["query", self.task_mode]
+        # 步骤 5：确保 step 不会暴露属于另一 task_mode 的 terminal action。
         invalid = set(self.allowed_actions) - {"query", self.task_mode}
         if invalid:
             raise ValueError(f"{self.task_mode} mode 不允许 actions: {sorted(invalid)}")
@@ -252,11 +275,13 @@ class MemoryOPDStep:
     def from_mapping(cls, value: Mapping[str, Any]) -> MemoryOPDStep:
         """从 Ray/DataLoader 传来的普通字典恢复类型化 step，并隔离后续修改。"""
 
+        # 步骤 1：深拷贝跨进程字典；步骤 2：构造 dataclass 并自动运行 __post_init__。
         return cls(**copy.deepcopy(dict(value)))
 
     def as_dict(self) -> dict[str, Any]:
         """转换为可序列化快照，供 trace、Dataset 和 Ray worker 传递。"""
 
+        # 步骤 1：递归展开 dataclass；嵌套列表和字典也会被复制为普通容器。
         return asdict(self)
 
 
@@ -269,27 +294,34 @@ class MemoryOPDPromptRenderer:
     """
 
     def __init__(self, config: MAgentConfig | None = None):
+        # 步骤 1：使用显式 rollout 配置；未提供时回退到 Mem-In-Action 默认配置。
         self.config = config or MAgentConfig()
 
     def _prompt_path(self, task_mode: MemoryTaskMode) -> str:
         """根据 controller 兼容模式选择固定 prompt 模板文件。"""
 
+        # 步骤 1：完整 legacy controller 始终使用旧模板。
         if self.config.controller_mode == "legacy":
             return self.config.legacy_prompt_path
+        # 步骤 2：新 controller 也可只为 update task 保留旧模板兼容行为。
         if task_mode == "update" and self.config.legacy_update_prompt:
             return self.config.legacy_prompt_path
+        # 步骤 3：其他情况使用当前统一 controller 模板。
         return self.config.prompt_path
 
     def _action_protocol(self, allowed_actions: list[MemoryAction]) -> str:
         """只向模型描述当前 step 实际允许执行的动作及其输出语法。"""
 
+        # 步骤 1：从空协议开始，仅加入当前 step 允许的动作。
         actions: list[str] = []
+        # 步骤 2：允许 query 时描述多行 query 格式及单次条数上限。
         if "query" in allowed_actions:
             actions.append(
                 "`<query>query 1\\nquery 2\\nquery 3</query>` loads related long-term memories "
                 "into Memory Cache. Put one query per line, with at most "
                 f"{self.config.max_queries_per_action} non-empty lines."
             )
+        # 步骤 3：允许 update 时根据配置描述 replace-cache 或 patch 协议。
         if "update" in allowed_actions:
             if self.config.update_protocol == "replace-cache":
                 update = (
@@ -302,22 +334,28 @@ class MemoryOPDPromptRenderer:
                     "operations. Unmentioned loaded items remain unchanged."
                 )
             actions.append(f"`<update>operations</update>` modifies long-term memory.\n{update}")
+        # 步骤 4：允许 answer 时声明最终回答格式。
         if "answer" in allowed_actions:
             actions.append("`<answer>concise answer</answer>` returns the final answer.")
+        # 步骤 5：编号后写入 prompt，帮助模型区分多个候选动作。
         return "\n".join(f"{index}. {action}" for index, action in enumerate(actions, start=1))
 
     def _task_policy(self, task_mode: MemoryTaskMode) -> str:
         """加载 update 或 answer 的固定策略说明。"""
 
+        # 步骤 1：根据 task_mode 选择策略文件。
         path = self.config.update_policy_path if task_mode == "update" else self.config.answer_policy_path
+        # 步骤 2：读取固定策略文本；其内容不由 Dataset 样本决定。
         return Path(path).read_text(encoding="utf-8").strip()
 
     @staticmethod
     def _to_messages(prompt: Any) -> list[dict[str, str]]:
         """将模板渲染结果统一成 tokenizer/AgentLoop 使用的 chat messages。"""
 
+        # 步骤 1：优先保留模板对象已经提供的多角色 message 结构。
         if hasattr(prompt, "to_messages"):
             return prompt.to_messages()
+        # 步骤 2：纯文本模板结果统一包装成单条 user message。
         return [{"role": "user", "content": str(prompt)}]
 
     def render_student_messages(self, step: MemoryOPDStep) -> list[dict[str, str]]:
@@ -327,7 +365,9 @@ class MemoryOPDPromptRenderer:
         AgentLoop 的 tokenizer；Dataset 中的兼容 ``raw_prompt`` 不参与真实 rollout。
         """
 
+        # 步骤 1：根据 task_mode 读取固定 controller 模板。
         template = Path(self._prompt_path(step.task_mode)).read_text(encoding="utf-8")
+        # 步骤 2：只使用 student 可见字段渲染当前动态状态。
         prompt = render_prompt_from_template(
             template,
             history=step.history,
@@ -338,6 +378,7 @@ class MemoryOPDPromptRenderer:
             action_protocol=self._action_protocol(step.allowed_actions),
             task_policy=self._task_policy(step.task_mode),
         )
+        # 步骤 3：统一转换为 AgentLoop 可以应用 chat template 的 messages。
         return self._to_messages(prompt)
 
     @staticmethod
@@ -348,6 +389,7 @@ class MemoryOPDPromptRenderer:
         提前泄露 teacher-only 信息。无效动作按普通 OPD 处理，不给予隐藏 memory。
         """
 
+        # 步骤 1：仅检索和写入动作允许 teacher 利用完整 memory 判断动作质量。
         return "privileged" if action in {"query", "update"} else "normal"
 
     def render_teacher_messages(
@@ -363,10 +405,13 @@ class MemoryOPDPromptRenderer:
         query/update 才注入完整 memory，并明确要求输出仍遵循 student action protocol。
         """
 
+        # 步骤 1：从 student prompt 深拷贝，保证 teacher 注入不会污染 student 输入。
         messages = copy.deepcopy(student_messages or self.render_student_messages(step))
+        # 步骤 2：answer/无效动作保持与 student 完全相同的可见上下文。
         if self.distillation_scope(action) == "normal":
             return messages
 
+        # 步骤 3：为 query/update 构造 teacher-only 规则和完整长期 memory。
         privileged_block = (
             "\n\nPrivileged OPD teacher view:\n"
             "- The student cannot see the Complete Long-Term Memory below.\n"
@@ -380,11 +425,13 @@ class MemoryOPDPromptRenderer:
             "Complete Long-Term Memory (teacher only):\n"
             f"{_render_full_memory(step.full_memory)}"
         )
+        # 步骤 4：定位已有 system message；不存在时创建一个。
         system_index = next((index for index, message in enumerate(messages) if message["role"] == "system"), None)
         if system_index is None:
             messages.insert(0, {"role": "system", "content": privileged_block.strip()})
         else:
             messages[system_index]["content"] += privileged_block
+        # 步骤 5：返回只供 teacher 计算条件概率的 messages。
         return messages
 
 
@@ -407,20 +454,26 @@ class MemoryOPDEpisodeCollector:
     """
 
     def __init__(self, memory: Memory, config: MAgentConfig | None = None):
+        # 步骤 1：保存唯一的活跃长期 Memory 环境；它会跨当前 episode 的 task 复用。
         self.memory = memory
+        # 步骤 2：加载 controller 和预算配置。
         self.config = config or MAgentConfig()
+        # 步骤 3：创建只保存当前 task 检索反馈的临时 QueryBuffer。
         self.query_buffer = QueryBuffer(enabled=self.config.query_feedback)
 
     def _seed_query_top_n(self, task_mode: MemoryTaskMode) -> int:
         """返回 task 开始前用 ``current_input`` 自动检索的条数。"""
 
+        # 步骤 1：answer task 可使用单独的起始检索条数。
         if task_mode == "answer" and self.config.answer_seed_query_top_n is not None:
             return self.config.answer_seed_query_top_n
+        # 步骤 2：其他情况优先使用统一 seed 配置，否则回退到普通 query_top_n。
         return self.config.seed_query_top_n if self.config.seed_query_top_n is not None else self.config.query_top_n
 
     def _full_memory_rows(self) -> list[dict[str, Any]]:
         """读取并序列化 teacher-only 的完整长期 memory。"""
 
+        # 步骤 1：读取 RAG 后端持有的完整长期 memory；步骤 2：序列化为冻结快照。
         return _serialize_memory_rows(list(getattr(self.memory.rag, "memory", [])))
 
     def _make_step(
@@ -436,7 +489,9 @@ class MemoryOPDEpisodeCollector:
         ``force_instruction`` 要求模型结束当前 task。
         """
 
+        # 步骤 1：读取当前 task 的 terminal 类型。
         task_mode: MemoryTaskMode = task["task_mode"]
+        # 步骤 2：预算耗尽时禁止继续 query，并注入强制结束指令。
         if force_terminal:
             force_instruction = (
                 self.config.force_update_instruction
@@ -447,6 +502,7 @@ class MemoryOPDEpisodeCollector:
         else:
             force_instruction = ""
             allowed_actions = ["query", task_mode]
+        # 步骤 3：同时冻结 student Cache 和 teacher-only 完整 memory，形成决策前状态。
         return MemoryOPDStep(
             episode_id=task["episode_id"],
             phase=task["phase"],
@@ -464,16 +520,21 @@ class MemoryOPDEpisodeCollector:
     def _run_initial_query(self, task: Mapping[str, Any]) -> None:
         """按配置执行 task 起始检索，使第一步可以看到基础 Cache。"""
 
+        # 步骤 1：计算当前 task 的自动起始检索预算。
         top_n = self._seed_query_top_n(task["task_mode"])
+        # 步骤 2：预算大于零时用 current_input 填充第一步可见 Cache。
         if top_n > 0:
             self.memory.query(task["current_input"], top_n=top_n)
 
     def _run_query(self, payload: str, task_mode: MemoryTaskMode, remaining: int) -> int:
         """执行一个 query action 中允许的多行 query，并返回实际执行条数。"""
 
+        # 步骤 1：update/answer 可使用不同的单条 query 检索深度。
         top_n = self.config.update_query_top_n if task_mode == "update" else self.config.query_top_n
+        # 步骤 2：清理模型输出中的空行，并受单动作和剩余总预算双重限制。
         queries = [line.strip() for line in payload.splitlines() if line.strip()]
         executed = queries[: min(self.config.max_queries_per_action, remaining)]
+        # 步骤 3：依次执行 query，并记录每条 query 新增了哪些 Cache vid。
         for query in executed:
             before_vids = {getattr(item, "vid", None) for item in self.memory.items}
             hits = self.memory.query(query, top_n=top_n)
@@ -489,22 +550,28 @@ class MemoryOPDEpisodeCollector:
                 dup_skip=len(hits) - len(new_vids),
                 new_vids=new_vids,
             )
+        # 步骤 4：返回真实执行条数，供 trajectory 累计 query 预算。
         return len(executed)
 
     def _apply_update(self, payload: str) -> dict[str, Any]:
         """复用 MAgentChat 的解析语义，把 terminal update 写回长期 memory。"""
 
+        # 步骤 1：按全局配置选择 replace-cache 或 patch 更新协议。
         if self.config.update_protocol == "replace-cache":
+            # 步骤 2A：解析完整目标 Cache；无法解析时返回错误而不修改 memory。
             texts = MAgentChat._extract_update_texts(payload)
             if not texts:
                 result = {"protocol": "replace-cache", "texts": []}
                 if payload.strip():
                     result["error"] = "no parseable numbered memory items"
                 return result
+            # 步骤 3A：将解析后的目标 Cache 批量写回长期 memory。
             self.memory.update_batch(texts)
             return {"protocol": "replace-cache", "texts": texts}
 
+        # 步骤 2B：patch 协议分别解析 replace/add/delete 操作。
         replacements, additions, deletions = MAgentChat._extract_update_patch(payload)
+        # 步骤 3B：非空 payload 若没有任何可解析操作，则拒绝静默更新。
         if payload.strip() and not (replacements or additions or deletions):
             return {
                 "protocol": "patch",
@@ -513,6 +580,7 @@ class MemoryOPDEpisodeCollector:
                 "deletions": [],
                 "error": "no parseable patch operations",
             }
+        # 步骤 4B：执行 patch；引用非法 vid 等错误转为 trace 可记录结果。
         try:
             result = self.memory.apply_patch(replacements, additions, deletions)
         except (KeyError, ValueError) as exc:
@@ -523,6 +591,7 @@ class MemoryOPDEpisodeCollector:
                 "deletions": deletions,
                 "error": str(exc),
             }
+        # 步骤 5B：序列化真实变更项，方便后续分析 update 行为。
         return {
             "protocol": "patch",
             "replacements": replacements,
@@ -546,21 +615,28 @@ class MemoryOPDEpisodeCollector:
 
         # 不允许上一个 task 的临时 Cache/query feedback 泄漏进当前 task；长期 memory
         # 不清空，因为 session 创建和后续 QA 正是通过它共享跨 task 信息。
+        # 步骤 1：清理上一个 task 的临时状态，并执行当前输入的自动起始检索。
         self.memory.clear_cache()
         self.query_buffer.clear()
         self._run_initial_query(task)
 
+        # 步骤 2：初始化 trajectory 预算、step trace 和 terminal 结果。
         query_rounds = 0
         records: list[dict[str, Any]] = []
         terminal_result: Any = None
         # 最后额外留一步强制 terminal，避免 query 预算耗尽后静默丢弃当前任务。
         for step_index in range(self.config.max_steps + 1):
+            # 步骤 3：根据总步数/query 预算决定当前轮是否必须 terminal。
             force_terminal = step_index >= self.config.max_steps or query_rounds >= self.config.max_query_rounds
+            # 步骤 4：在动作执行前冻结当前环境，作为本轮可复现训练状态。
             step = self._make_step(task, step_index=step_index, force_terminal=force_terminal)
+            # 步骤 5：请求 student 对冻结 step 生成一次动作文本。
             response_text = str(await generate_step(step))
+            # 步骤 6：解析动作，并读取当前 step 实际允许的动作集合。
             action, payload = parse_memory_action(response_text)
             allowed = set(step.allowed_actions)
             status = "proposed"
+            # 步骤 7：按动作类型校验并推进 Memory 环境；无效动作不修改状态。
             if action not in allowed:
                 status = "disallowed" if action is not None else "invalid"
             elif action == "query" and payload:
@@ -578,6 +654,7 @@ class MemoryOPDEpisodeCollector:
                 terminal_result = payload
                 status = "terminal"
 
+            # 步骤 8：保存动作执行前状态、模型输出和执行结果，形成可训练 trace。
             records.append(
                 {
                     "memory_step": step.as_dict(),
@@ -587,11 +664,13 @@ class MemoryOPDEpisodeCollector:
                     "status": status,
                 }
             )
+            # 步骤 9：terminal 动作结束当前 task；query/无效动作继续创建下一 step。
             if status == "terminal":
                 break
 
         # final_memory 用于 trace/debug；下一个 task 会继续使用同一长期 Memory，
         # 但从干净的临时 Cache 和 QueryBuffer 开始。
+        # 步骤 10：冻结 task 完成后的长期 memory，并清理临时状态。
         final_memory = self._full_memory_rows()
         self.memory.clear_cache()
         self.query_buffer.clear()
@@ -613,9 +692,12 @@ class MemoryOPDEpisodeCollector:
         Memory 实例上运行，因此可以测试之前创建的记忆是否足以支持回答。
         """
 
+        # 步骤 1：准备保存按执行顺序完成的 task trajectory。
         tasks = []
+        # 步骤 2：先执行全部 session update，再执行全部 QA answer。
         for task in iter_memory_episode_tasks(memory_episode):
             tasks.append(await self._collect_task(task, generate_step))
+        # 步骤 3：同时返回分 task trace、扁平 step buffer 和 episode 最终 memory。
         return {
             "episode_id": memory_episode["episode_id"],
             "tasks": tasks,
@@ -636,10 +718,13 @@ class MemoryOPDStepAgentLoop(AgentLoopBase):
     """
 
     def __init__(self, *args, **kwargs):
+        # 步骤 1：让 VeRL AgentLoopBase 初始化 tokenizer、rollout server 和配置。
         super().__init__(*args, **kwargs)
+        # 步骤 2：缓存动态 prompt 和单次 action response 的 token 长度上限。
         self.prompt_length = self.rollout_config.prompt_length
         self.response_length = self.rollout_config.response_length
         # Prompt 路径和动作协议是全局 rollout 配置，不随 Dataset 样本变化。
+        # 步骤 3：从 rollout 配置构造全局 PromptRenderer。
         prompt_config = dict(self.rollout_config.agent.get("memory_opd_prompt", {}) or {})
         self.renderer = MemoryOPDPromptRenderer(MAgentConfig(**prompt_config))
 
@@ -649,15 +734,19 @@ class MemoryOPDStepAgentLoop(AgentLoopBase):
 
         # Dataset 传入的是普通 dict。恢复为 MemoryOPDStep 会再次执行边界校验，避免
         # 损坏的 trace 在生成阶段悄悄进入模型。
+        # 步骤 1：恢复并验证 Dataset 传入的冻结 memory_step。
         step = MemoryOPDStep.from_mapping(kwargs["memory_step"])
+        # 步骤 2：用固定模板和当前动态状态生成 cache-only student messages。
         student_messages = self.renderer.render_student_messages(step)
         # tokenizer 只在 rollout 阶段使用，因为此刻动态 Cache 和最终 prompt 才已确定。
+        # 步骤 3：应用 actor chat template，并检查真实动态 prompt 长度。
         prompt_ids = await self.apply_chat_template(student_messages)
         if len(prompt_ids) > self.prompt_length:
             raise ValueError(
                 f"Memory-OPD student prompt 长度 {len(prompt_ids)} 超过 rollout.prompt_length={self.prompt_length}"
             )
 
+        # 步骤 4：调用 rollout server，从当前 student policy 采样一个 action response。
         metrics = {}
         with simple_timer("generate_sequences", metrics):
             output: TokenOutput = await self.server_manager.generate(
@@ -665,17 +754,20 @@ class MemoryOPDStepAgentLoop(AgentLoopBase):
                 prompt_ids=prompt_ids,
                 sampling_params=sampling_params,
             )
+        # 步骤 5：裁剪响应、解码文本并解析 student 实际选择的 Memory action。
         response_ids = output.token_ids[: self.response_length]
         response_text = self.tokenizer.decode(response_ids, skip_special_tokens=True)
         action, payload = parse_memory_action(response_text)
         # Teacher prompt 必须在知道 student 实际采样了什么动作后构造，才能决定是否允许
         # 注入 full_memory。Teacher 评价同一 response，不在这里重新生成。
+        # 步骤 6：按实际 action 构造 normal 或 privileged teacher messages。
         teacher_messages = self.renderer.render_teacher_messages(
             step,
             action,
             student_messages=student_messages,
         )
 
+        # 步骤 7：将 student sequence、生成指标和 teacher 评分元数据封装给 Worker。
         result = AgentLoopOutput(
             prompt_ids=prompt_ids,
             response_ids=response_ids,
@@ -704,6 +796,7 @@ class MemoryOPDStepAgentLoop(AgentLoopBase):
                 **output.extra_fields,
             },
         )
+        # 步骤 8：返回 single-turn rollout；本 AgentLoop 不执行 action 或推进 Memory。
         return result
 
 
@@ -722,6 +815,7 @@ class PrivilegeOPDAgentLoopWorker(AgentLoopWorker):
     async def _compute_score(self, outputs: list[AgentLoopOutput], kwargs: dict) -> None:
         """纯 OPD 不计算 reward；保留签名以跳过默认 RewardLoop 调用。"""
 
+        # 步骤 1：明确跳过 RewardLoop，teacher distillation loss 是当前唯一训练信号。
         return None
 
     async def _compute_teacher_logprobs(
@@ -739,21 +833,26 @@ class PrivilegeOPDAgentLoopWorker(AgentLoopWorker):
         sequence 等长的 tensor，使 VeRL 原有蒸馏 loss 可以继续按 ``response_mask`` 工作。
         """
 
+        # 步骤 1：未启用蒸馏或处于 validation 时不请求 teacher server。
         if not self.distillation_enabled or validate:
             return
 
+        # 步骤 2：取出 MemoryOPDStepAgentLoop 构造的自定义 teacher prompt。
         teacher_prompt = output.extra_fields.pop("teacher_prompt", None)
         if teacher_prompt is None:
             # 非 Memory-OPD loop 或未提供自定义 teacher prompt 时，保持 VeRL 默认行为。
+            # 步骤 3A：回退到 VeRL 默认的同 prompt teacher 评分路径。
             await super()._compute_teacher_logprobs(output, prompt_ids, response_ids, validate, sample_kwargs)
             return
 
+        # 步骤 3B：从样本字段读取可选 teacher routing key，用于多 teacher 路由。
         routing_key = None
         if sample_kwargs is not None:
             routing_value = sample_kwargs.get(self.teacher_key)
             if routing_value is not None:
                 routing_key = routing_value.item() if hasattr(routing_value, "item") else routing_value
 
+        # 步骤 4：独立 tokenize teacher prompt；它的 prefix 长度可以与 student 不同。
         teacher_prompt_ids = normalize_token_ids(
             apply_chat_template(
                 self.tokenizer,
@@ -763,6 +862,7 @@ class PrivilegeOPDAgentLoopWorker(AgentLoopWorker):
                 **self.config.data.get("apply_chat_template_kwargs", {}),
             )
         )
+        # 步骤 5：让 teacher 在自己的上下文下评价 student 已采样的同一串 response token。
         teacher_ids, teacher_logprobs = await self.teacher_server_manager.compute_teacher_logprobs_single(
             # response_ids 必须直接复用 student 采样结果，不能由 teacher 重新 tokenize 文本，
             # 否则两侧 token 边界可能不同，无法逐 token 蒸馏。
@@ -772,14 +872,17 @@ class PrivilegeOPDAgentLoopWorker(AgentLoopWorker):
 
         # 蒸馏 loss 仅使用 response_mask 覆盖的位置。teacher prompt 部分填充占位值，
         # teacher response 部分则与 student response 逐 token 对齐。
+        # 步骤 6：创建与 student sequence 等长的占位 tensor。
         student_sequence_length = len(prompt_ids) + len(response_ids)
         teacher_id_shape = (student_sequence_length, *teacher_ids.shape[1:])
         teacher_logprob_shape = (student_sequence_length, *teacher_logprobs.shape[1:])
         aligned_ids = torch.full(teacher_id_shape, self.tokenizer.pad_token_id, dtype=teacher_ids.dtype)
         aligned_logprobs = torch.zeros(teacher_logprob_shape, dtype=teacher_logprobs.dtype)
+        # 步骤 7：只把 teacher response 区间对齐到 student response 位置。
         if response_ids:
             aligned_ids[-len(response_ids) :] = teacher_ids[-len(response_ids) :]
             aligned_logprobs[-len(response_ids) :] = teacher_logprobs[-len(response_ids) :]
+        # 步骤 8：写回 VeRL 约定字段，供 actor distillation loss 消费。
         output.extra_fields["teacher_ids"] = aligned_ids
         output.extra_fields["teacher_logprobs"] = aligned_logprobs
 
@@ -796,7 +899,9 @@ class PrivilegeOPDAgentLoopManager(AgentLoopManager):
     """
 
     def __init__(self, *args, **kwargs):
+        # 步骤 1：在父 Manager 创建 worker group 前指定自定义 privileged OPD Worker。
         self.agent_loop_workers_class = ray.remote(PrivilegeOPDAgentLoopWorker)
+        # 步骤 2：复用 VeRL Manager 完成 Ray worker、rollout server 和调度初始化。
         super().__init__(*args, **kwargs)
 
 

@@ -47,7 +47,9 @@ class RayPrivilegeOPDTrainer(RayPPOTrainer):
     """
 
     def __init__(self, *args, **kwargs):
+        # 步骤 1：复用 RayPPOTrainer 初始化 DataLoader、worker、rollout manager 和 checkpoint。
         super().__init__(*args, **kwargs)
+        # 步骤 2：在训练启动前验证当前配置确实满足纯 Memory-OPD 算法边界。
         self._validate_memory_opd_config()
 
     def _validate_memory_opd_config(self) -> None:
@@ -57,24 +59,29 @@ class RayPrivilegeOPDTrainer(RayPPOTrainer):
         Memory 环境的情况下隐式复制 step；它无法决定哪个分支应写回长期 memory。
         """
 
+        # 步骤 1：纯 OPD 必须启用 teacher distillation。
         if not is_distillation_enabled(self.config.get("distillation")):
             raise ValueError("RayPrivilegeOPDTrainer 要求 distillation.enabled=True")
+        # 步骤 2：禁止把任务 reward 混入当前蒸馏 loss。
         if self.config.distillation.distillation_loss.use_task_rewards:
             raise ValueError(
                 "Memory-OPD 当前不使用任务 reward；请设置 "
                 "distillation.distillation_loss.use_task_rewards=False"
             )
+        # 步骤 3：禁止启动神经 Reward Model、Critic 和 reference-policy KL。
         if need_reward_model(self.config):
             raise ValueError("Memory-OPD 当前不使用 Reward Model；请关闭 reward.reward_model")
         if need_critic(self.config):
             raise ValueError("Memory-OPD 当前不使用 Critic；请使用无需 critic 的配置")
         if need_reference_policy(self.config):
             raise ValueError("Memory-OPD 当前不使用 reference policy 或 reward KL")
+        # 步骤 4：禁止 Trainer 隐式复制状态；多分支必须由状态化 Collector 管理。
         if self.config.actor_rollout_ref.rollout.n != 1:
             raise ValueError(
                 "状态化 Memory episode 当前要求 rollout.n=1；同状态多分支采样需要由 "
                 "Episode Collector 显式管理，不能让 Trainer 隐式 repeat"
             )
+        # 步骤 5：禁止依赖任务 reward 的默认 validation 路径。
         test_freq = self.config.trainer.get("test_freq", -1)
         if self.config.trainer.get("val_before_train", False) or (test_freq is not None and test_freq > 0):
             raise ValueError(
@@ -89,13 +96,16 @@ class RayPrivilegeOPDTrainer(RayPPOTrainer):
         Memory 状态。``memory_step`` 已经是可被 single-turn AgentLoop 消费的冻结快照。
         """
 
+        # 步骤 1：拒绝尚未由 Collector 展开的完整 episode。
         if "memory_episode" in batch.non_tensor_batch:
             raise ValueError(
                 "RayPrivilegeOPDTrainer 不能直接消费 memory_episode。请先由 Agentic "
                 "Episode Collector 将 episode 展开为包含 memory_step 的 single-turn 样本。"
             )
+        # 步骤 2：确认每条样本携带 single-turn AgentLoop 实际消费的冻结 step。
         if "memory_step" not in batch.non_tensor_batch:
             raise KeyError("Memory-OPD 训练样本必须包含 memory_step")
+        # 步骤 3：复用父类逻辑移除 rollout 不需要的 tensor 字段并生成 gen batch。
         return super()._get_gen_batch(batch)
 
     def fit(self):
@@ -110,6 +120,7 @@ class RayPrivilegeOPDTrainer(RayPPOTrainer):
         ``teacher_ids``/``teacher_logprobs``。
         """
 
+        # 步骤 1：初始化实验日志；完整解析后的配置一并记录，便于复现实验。
         logger = Tracking(
             project_name=self.config.trainer.project_name,
             experiment_name=self.config.trainer.experiment_name,
@@ -117,21 +128,27 @@ class RayPrivilegeOPDTrainer(RayPPOTrainer):
             config=OmegaConf.to_container(self.config, resolve=True),
         )
 
+        # 步骤 2：恢复 checkpoint，并把当前 actor 权重同步到 rollout replicas。
         self.global_steps = 0
         self._load_checkpoint()
         self.checkpoint_manager.update_weights(self.global_steps)
+        # 步骤 3：根据恢复后的 global step 计算起始 epoch，并初始化进度条。
         current_epoch = self.global_steps // len(self.train_dataloader)
         progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="Memory-OPD")
         self.global_steps += 1
 
+        # 步骤 4：读取 OPD loss 是否需要额外重算 student old log-prob。
         use_policy_gradient = self.config.distillation.distillation_loss.use_policy_gradient
+        # 步骤 5：按 epoch 和 DataLoader batch 进入纯 OPD 训练循环。
         for epoch in range(current_epoch, self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
+                # 步骤 6：计算终止条件，并为当前训练 step 初始化日志指标。
                 is_last_step = self.global_steps >= self.total_training_steps
                 metrics = {
                     "training/global_step": self.global_steps,
                     "training/epoch": epoch,
                 }
+                # 步骤 7：把 collate_fn 输出转换为 VeRL DataProto。
                 batch = DataProto.from_single_dict(batch_dict)
                 # 每个展开后的 step 是一个独立蒸馏样本。这里的 uid 用于 VeRL 内部追踪，
                 # 不代表 episode 身份；episode_id 仍保存在 memory_step/extra_info 中。
@@ -139,8 +156,10 @@ class RayPrivilegeOPDTrainer(RayPPOTrainer):
                     [str(uuid.uuid4()) for _ in range(len(batch.batch))],
                     dtype=object,
                 )
+                # 步骤 8：把 rollout temperature 写入元数据，供后续 loss/指标使用。
                 batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
 
+                # 步骤 9：验证并提取 generation batch，标记当前不是 validation。
                 gen_batch = self._get_gen_batch(batch)
                 gen_batch.meta_info.update(
                     {
@@ -148,18 +167,22 @@ class RayPrivilegeOPDTrainer(RayPPOTrainer):
                         "validate": False,
                     }
                 )
+                # 步骤 10：执行 student rollout；自定义 Worker 同时计算 teacher log-prob。
                 gen_output = self.async_rollout_manager.generate_sequences(gen_batch)
                 # generate_sequences 已完成 student rollout 和 teacher log-prob 计算。
                 # 后续训练循环不再执行 Memory action，也不改变 Collector 环境。
+                # 步骤 11：暂停 rollout replicas 释放资源，并合并生成输出与原始 step 数据。
                 self.checkpoint_manager.sleep_replicas()
                 metrics.update(gen_output.meta_info.pop("timing", {}))
                 batch = batch.union(gen_output)
 
+                # 步骤 12：构造 response mask，并按配置平衡各 worker 的有效 token 数。
                 if "response_mask" not in batch.batch:
                     # 蒸馏 loss 只应覆盖 student 生成的 response token，不能训练动态 prompt。
                     batch.batch["response_mask"] = compute_response_mask(batch)
                 if self.config.trainer.balance_batch:
                     self._balance_batch(batch, metrics=metrics)
+                # 步骤 13：记录每条序列 token 数；纯文本 Memory-OPD 没有图片序列。
                 batch.meta_info["global_token_num"] = torch.sum(
                     batch.batch["attention_mask"],
                     dim=-1,
@@ -167,6 +190,7 @@ class RayPrivilegeOPDTrainer(RayPPOTrainer):
                 batch.meta_info["images_seqlens"] = []
 
                 # OPD 的 policy-gradient 形式只需要 old_log_probs，不需要 task advantage。
+                # 步骤 14：可选计算 OPD policy-gradient estimator 所需 old log-prob。
                 if use_policy_gradient:
                     # 这是 OPD loss 自身可选的 estimator 输入，不是 PPO task advantage。
                     old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(batch)
@@ -174,9 +198,11 @@ class RayPrivilegeOPDTrainer(RayPPOTrainer):
                     batch = batch.union(old_log_prob)
                     metrics["perf/mfu/actor_infer"] = old_log_prob_mfu
 
+                # 步骤 15：用 teacher log-prob 和 response mask 更新 actor 参数。
                 actor_output = self._update_actor(batch)
                 metrics.update(reduce_metrics(actor_output.meta_info["metrics"]))
 
+                # 步骤 16：按保存频率持久化 checkpoint，并同步新 actor 权重到 replicas。
                 should_save = self.config.trainer.save_freq > 0 and (
                     is_last_step or self.global_steps % self.config.trainer.save_freq == 0
                 )
@@ -184,18 +210,21 @@ class RayPrivilegeOPDTrainer(RayPPOTrainer):
                     self._save_checkpoint()
                 self.checkpoint_manager.update_weights(self.global_steps)
 
+                # 步骤 17：写入日志、推进进度，并通知 Dataset 当前 batch 已训练完成。
                 logger.log(data=metrics, step=self.global_steps)
                 progress_bar.update(1)
                 if hasattr(self.train_dataset, "on_batch_end"):
                     self.train_dataset.on_batch_end(batch=batch)
                 self.global_steps += 1
 
+                # 步骤 18：达到总训练步数时关闭资源并结束训练。
                 if is_last_step:
                     progress_bar.close()
                     self._shutdown_dump_executor()
                     pprint("Memory-OPD training finished.")
                     return
 
+        # 步骤 19：所有 epoch 自然结束时同样关闭进度条和异步 dump executor。
         progress_bar.close()
         self._shutdown_dump_executor()
 
