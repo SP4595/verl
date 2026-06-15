@@ -60,22 +60,27 @@ def validate_memory_episode(episode: Mapping[str, Any]) -> None:
     - ``metadata``：只用于追踪和扩展，不参与核心状态机。
     """
 
+    # 步骤 1：检查 Collector 入口所需的全部顶层字段。
     required_keys = ("schema_version", "episode_id", "source", "sessions", "qa", "metadata")
     missing_keys = [key for key in required_keys if key not in episode]
     if missing_keys:
         raise KeyError(f"memory_episode 缺少字段: {missing_keys}")
+    # 步骤 2：验证 schema 版本和 episode 稳定身份。
     if episode["schema_version"] != 1:
         raise ValueError(f"不支持的 memory_episode.schema_version: {episode['schema_version']!r}")
     if not isinstance(episode["episode_id"], str) or not episode["episode_id"]:
         raise TypeError("memory_episode.episode_id 必须是非空字符串")
+    # 步骤 3：验证可顺序遍历的 sessions/QA 和 metadata 容器。
     if not isinstance(episode["sessions"], list) or not isinstance(episode["qa"], list):
         raise TypeError("memory_episode.sessions 和 memory_episode.qa 必须是 list")
     if not isinstance(episode["metadata"], Mapping):
         raise TypeError("memory_episode.metadata 必须是 dict")
 
+    # 步骤 4：逐 session 验证 update task 必需的非空 input。
     for index, session in enumerate(episode["sessions"]):
         if not isinstance(session, Mapping) or not str(session.get("input") or "").strip():
             raise TypeError(f"memory_episode.sessions[{index}] 必须包含非空 input")
+    # 步骤 5：逐 QA 验证 answer task 必需的非空 question。
     for index, qa in enumerate(episode["qa"]):
         if not isinstance(qa, Mapping) or not str(qa.get("question") or "").strip():
             raise TypeError(f"memory_episode.qa[{index}] 必须包含非空 question")
@@ -94,10 +99,12 @@ def validate_sample(sample: Mapping[str, Any], require_ground_truth: bool = True
     当前 AgentLoop 用于模型输入。
     """
 
+    # 步骤 1：检查同 batch 所需的稳定顶层 key。
     missing_keys = [key for key in NORMALIZED_SAMPLE_KEYS if key not in sample]
     if missing_keys:
         raise KeyError(f"Dataset 样本缺少 VeRL 必需字段: {missing_keys}")
 
+    # 步骤 2：验证 raw_prompt/兼容占位的 chat message 结构。
     raw_prompt = sample["raw_prompt"]
     if not isinstance(raw_prompt, list) or not raw_prompt:
         raise TypeError("raw_prompt 必须是非空 list[dict]，例如 [{'role': 'user', 'content': '...'}]")
@@ -107,20 +114,24 @@ def validate_sample(sample: Mapping[str, Any], require_ground_truth: bool = True
         if "role" not in message or "content" not in message:
             raise KeyError(f"raw_prompt[{message_index}] 必须同时包含 role 和 content")
 
+    # 步骤 3：验证任务或路由使用的 data_source。
     data_source = sample["data_source"]
     if not isinstance(data_source, str) or not data_source:
         raise TypeError("data_source 必须是非空字符串")
 
+    # 步骤 4：验证 reward 元数据，并按训练模式决定是否要求 ground truth。
     reward_model = sample["reward_model"]
     if not isinstance(reward_model, Mapping):
         raise TypeError(f"reward_model 必须是 dict，实际为 {type(reward_model)!r}")
     if require_ground_truth and reward_model.get("ground_truth") is None:
         raise KeyError("reward_model.ground_truth 缺失；规则奖励默认需要该字段")
 
+    # 步骤 5：验证所有会进入 non_tensor_batch 的公共 mapping 字段。
     for key in ("extra_info", "tools_kwargs", "interaction_kwargs"):
         if not isinstance(sample[key], Mapping):
             raise TypeError(f"{key} 必须是 dict，实际为 {type(sample[key])!r}")
 
+    # 步骤 6：确保纯非 tensor 样本仍可由 DataProto 推断 batch size。
     if not isinstance(sample["dummy_tensor"], torch.Tensor):
         raise TypeError("dummy_tensor 必须是 torch.Tensor，否则 DataProto.batch 可能为空")
 

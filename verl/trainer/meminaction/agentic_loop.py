@@ -67,11 +67,16 @@ from verl.utils.rollout_trace import rollout_trace_op
 from verl.utils.tokenizer import normalize_token_ids
 from verl.workers.rollout.replica import TokenOutput
 
+# 一个高层 task 的目标：session 写入最终必须 update，QA 最终必须 answer。
 MemoryTaskMode = Literal["update", "answer"]
+# Controller 单轮允许生成的三种动作；query 是非终止动作，update/answer 是终止动作。
 MemoryAction = Literal["query", "update", "answer"]
+# Teacher 对当前 student response 的信息权限：是否允许额外查看完整长期 memory。
 DistillationScope = Literal["privileged", "normal"]
 
+# 只接受完整闭合的动作标签；payload 可以跨行。
 _ACTION_PATTERN = re.compile(r"<(query|update|answer)>(.*?)</\1>", re.IGNORECASE | re.DOTALL)
+# 动作解析前删除完整 think 块，防止思考中的示例动作被真实执行。
 _THINK_PATTERN = re.compile(r"<think\b[^>]*>.*?</think>", re.IGNORECASE | re.DOTALL)
 
 
@@ -238,17 +243,29 @@ class MemoryOPDStep:
     Memory 环境重新创建下一条 Step，不能原地修改旧 Step 来代表新状态。
     """
 
+    # 跨 session、QA 和展开 step 保持不变的 episode 身份。
     episode_id: str
+    # 当前 step 属于写入长期 memory 的 session 阶段，还是读取 memory 的 QA 阶段。
     phase: Literal["memory_creation", "qa"]
+    # 当前 trajectory 的合法终止动作；update task 不能 answer，反之亦然。
     task_mode: MemoryTaskMode
+    # 当前 session 文本或 QA 问题，是本 step 的主要外部输入。
     current_input: str
+    # Student 当前可见的临时检索 Cache；其中 vid 可用于 update patch。
     memory_cache: list[Any] = field(default_factory=list)
+    # Teacher-only 的完整长期 memory 快照，绝不能进入 student prompt。
     full_memory: list[Any] = field(default_factory=list)
+    # 预留给显式对话历史的字段；当前 single-turn Memory-OPD 默认不使用。
     history: str = "(not applicable)"
+    # 当前 task 已执行 query 的反馈摘要，帮助 student 判断是否继续检索。
     query_feedback: str = "(no previous active queries)"
+    # 预算耗尽时注入的强制 terminal 指令；普通 step 为空。
     force_instruction: str = ""
+    # 当前 step 对 student 公开的真实动作空间。
     allowed_actions: list[MemoryAction] = field(default_factory=list)
+    # 当前 task 内从 0 开始的决策序号，不是全局训练 step。
     step_index: int = 0
+    # 来源 session/QA 的追踪字段，不参与核心 prompt 协议。
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:

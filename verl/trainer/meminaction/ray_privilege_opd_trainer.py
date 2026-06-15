@@ -140,6 +140,9 @@ class RayPrivilegeOPDTrainer(RayPPOTrainer):
         # 步骤 4：读取 OPD loss 是否需要额外重算 student old log-prob。
         use_policy_gradient = self.config.distillation.distillation_loss.use_policy_gradient
         # 步骤 5：按 epoch 和 DataLoader batch 进入纯 OPD 训练循环。
+        
+        # Note： 这里面每个 batch可能会被切分成无数个single turn batch。
+        
         for epoch in range(current_epoch, self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
                 # 步骤 6：计算终止条件，并为当前训练 step 初始化日志指标。
