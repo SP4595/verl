@@ -48,6 +48,7 @@ import ray
 import torch
 from mem_in_action.agents.magentchat import MAgentChat
 from mem_in_action.configs import MAgentConfig
+from mem_in_action.llms.openvllm import THINK_CLOSE, split_thinking_answer
 from mem_in_action.llms.openai_llm import render_prompt_from_template
 from mem_in_action.memory.memory import Memory
 from mem_in_action.memory.querys import QueryBuffer
@@ -80,6 +81,23 @@ _ACTION_PATTERN = re.compile(r"<(query|update|answer)>(.*?)</\1>", re.IGNORECASE
 _THINK_PATTERN = re.compile(r"<think\b[^>]*>.*?</think>", re.IGNORECASE | re.DOTALL)
 
 
+def visible_memory_response_text(text: str) -> str:
+    """返回可执行 action parser 应看到的公开输出。
+
+    Qwen/vLLM 类 tokenizer 解码时可能只保留 ``</think>`` closing tag，或在触达
+    response length 时留下未闭合 thinking。这里与 Mem-In-Action LLM 适配器一致：
+    有 closing tag 时只解析最后一个 ``</think>`` 之后的文本；存在未闭合 opening tag
+    时不执行任何 action；普通非 thinking 输出按原样解析。
+    """
+
+    if THINK_CLOSE in text:
+        split = split_thinking_answer(text, thinking_enabled=True)
+        return split.answer if split.parse_success else ""
+    if re.search(r"<think\b[^>]*>", text, re.IGNORECASE):
+        return ""
+    return _THINK_PATTERN.sub("", text).strip()
+
+
 def parse_memory_action(text: str) -> tuple[str | None, str]:
     """从模型输出中解析第一个可执行 action。
 
@@ -91,7 +109,7 @@ def parse_memory_action(text: str) -> tuple[str | None, str]:
     """
 
     # 步骤 1：移除不可执行的思考内容，只保留模型最终公开输出。
-    visible_text = _THINK_PATTERN.sub("", text).strip()
+    visible_text = visible_memory_response_text(text)
     # 步骤 2：在公开输出中查找第一个完整闭合的 Memory action tag。
     match = _ACTION_PATTERN.search(visible_text)
     # 步骤 3：规范化 action 名称并返回 payload；未命中时显式返回无效动作。
@@ -321,7 +339,11 @@ class MemoryOPDPromptRenderer:
         if self.config.controller_mode == "legacy":
             return self.config.legacy_prompt_path
         # 步骤 2：新 controller 也可只为 update task 保留旧模板兼容行为。
-        if task_mode == "update" and self.config.legacy_update_prompt:
+        if (
+            task_mode == "update"
+            and self.config.legacy_update_prompt
+            and self.config.update_protocol == "replace-cache"
+        ):
             return self.config.legacy_prompt_path
         # 步骤 3：其他情况使用当前统一 controller 模板。
         return self.config.prompt_path
@@ -334,21 +356,25 @@ class MemoryOPDPromptRenderer:
         # 步骤 2：允许 query 时描述多行 query 格式及单次条数上限。
         if "query" in allowed_actions:
             actions.append(
-                "`<query>query 1\\nquery 2\\nquery 3</query>` loads related long-term memories "
-                "into Memory Cache. Put one query per line, with at most "
+                "`<query>query 1\nquery 2\nquery 3</query>` loads related long-term memories into "
+                "Memory Cache. Put one query per line, with at most "
                 f"{self.config.max_queries_per_action} non-empty lines."
             )
         # 步骤 3：允许 update 时根据配置描述 replace-cache 或 patch 协议。
         if "update" in allowed_actions:
             if self.config.update_protocol == "replace-cache":
                 update = (
-                    "Inside <update>, output the entire desired cache as numbered lines. Every loaded "
-                    "item omitted from the list is permanently deleted."
+                    "Replace-cache protocol: inside <update>, output the entire desired cache "
+                    "as numbered lines. Every loaded item omitted from the list is permanently deleted."
                 )
             else:
                 update = (
-                    "Inside <update>, use visible Cache IDs with <replace>, <add>, and <delete> "
-                    "operations. Unmentioned loaded items remain unchanged."
+                    "Stable patch protocol: inside <update>, emit zero or more operations, one per line: "
+                    '<replace id="VID">complete replacement text</replace> to update a loaded item in place; '
+                    "<add>new self-contained atomic memory</add> to create an unmatched item; "
+                    '<delete id="VID"/> only when the input explicitly proves a loaded item is false or redundant. '
+                    "Unmentioned loaded items remain unchanged. Use the visible [VID] from Memory Cache. "
+                    "An empty <update></update> is a valid no-op."
                 )
             actions.append(f"`<update>operations</update>` modifies long-term memory.\n{update}")
         # 步骤 4：允许 answer 时声明最终回答格式。
@@ -510,11 +536,7 @@ class MemoryOPDEpisodeCollector:
         task_mode: MemoryTaskMode = task["task_mode"]
         # 步骤 2：预算耗尽时禁止继续 query，并注入强制结束指令。
         if force_terminal:
-            force_instruction = (
-                self.config.force_update_instruction
-                if task_mode == "update"
-                else self.config.force_answer_instruction
-            )
+            force_instruction = self._force_terminal_instruction(task_mode)
             allowed_actions: list[MemoryAction] = [task_mode]
         else:
             force_instruction = ""
@@ -533,6 +555,15 @@ class MemoryOPDEpisodeCollector:
             step_index=step_index,
             metadata=copy.deepcopy(dict(task.get("metadata") or {})),
         )
+
+    def _force_terminal_instruction(self, task_mode: MemoryTaskMode) -> str:
+        """返回当前 task 的协议感知强制终止提示。"""
+
+        if task_mode == "update":
+            if self.config.update_protocol == "patch":
+                return self.config.force_patch_update_instruction
+            return self.config.force_update_instruction
+        return self.config.force_answer_instruction
 
     def _run_initial_query(self, task: Mapping[str, Any]) -> None:
         """按配置执行 task 起始检索，使第一步可以看到基础 Cache。"""
@@ -666,7 +697,15 @@ class MemoryOPDEpisodeCollector:
                 status = "query_applied" if executed else "query_empty"
             elif action == "update":
                 terminal_result = self._apply_update(payload)
-                status = "terminal"
+                if (
+                    self.config.update_protocol == "patch"
+                    and isinstance(terminal_result, Mapping)
+                    and terminal_result.get("error")
+                    and not force_terminal
+                ):
+                    status = "invalid_update"
+                else:
+                    status = "terminal"
             elif action == "answer":
                 terminal_result = payload
                 status = "terminal"
@@ -773,7 +812,7 @@ class MemoryOPDStepAgentLoop(AgentLoopBase):
             )
         # 步骤 5：裁剪响应、解码文本并解析 student 实际选择的 Memory action。
         response_ids = output.token_ids[: self.response_length]
-        response_text = self.tokenizer.decode(response_ids, skip_special_tokens=True)
+        response_text = self.tokenizer.decode(response_ids, skip_special_tokens=False)
         action, payload = parse_memory_action(response_text)
         # Teacher prompt 必须在知道 student 实际采样了什么动作后构造，才能决定是否允许
         # 注入 full_memory。Teacher 评价同一 response，不在这里重新生成。
@@ -931,4 +970,5 @@ __all__ = [
     "PrivilegeOPDAgentLoopWorker",
     "iter_memory_episode_tasks",
     "parse_memory_action",
+    "visible_memory_response_text",
 ]

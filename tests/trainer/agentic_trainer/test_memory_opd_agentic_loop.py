@@ -13,6 +13,7 @@ from verl.trainer.agentic_trainer.agentic_loop import (
     MemoryOPDStep,
     iter_memory_episode_tasks,
     parse_memory_action,
+    visible_memory_response_text,
 )
 
 
@@ -109,6 +110,17 @@ def test_parse_memory_action_ignores_thinking_block():
     assert payload == "Alice location"
 
 
+def test_parse_memory_action_uses_text_after_qwen_think_close():
+    raw = "hidden <answer>wrong</answer></think>\n<query>Alice location</query>"
+
+    assert visible_memory_response_text(raw) == "<query>Alice location</query>"
+    assert parse_memory_action(raw) == ("query", "Alice location")
+
+
+def test_parse_memory_action_rejects_unclosed_thinking():
+    assert parse_memory_action("<think><query>Alice location</query>") == (None, "")
+
+
 def test_episode_tasks_create_memory_before_running_qa():
     tasks = list(
         iter_memory_episode_tasks(
@@ -165,6 +177,25 @@ class _FakeMemory:
         ]
         self.query("", top_n=len(texts))
 
+    def apply_patch(self, replacements, additions, deletions):
+        by_vid = {item.vid: item for item in self._cache}
+        if any(vid not in by_vid for vid in replacements) or any(vid not in by_vid for vid in deletions):
+            raise KeyError("unknown vid")
+        replaced = []
+        for vid, text in replacements.items():
+            by_vid[vid].content = text
+            replaced.append(by_vid[vid])
+        deleted = [by_vid[vid] for vid in deletions]
+        self._cache = [item for item in self._cache if item.vid not in set(deletions)]
+        next_vid = max((item.vid for item in self._cache), default=0) + 1
+        added = [SimpleNamespace(vid=next_vid + index, content=text) for index, text in enumerate(additions)]
+        self._cache.extend(added)
+        self.rag.memory = [
+            {"rid": f"m{index}", "content": item.content, "metadata": {}}
+            for index, item in enumerate(self._cache, start=1)
+        ]
+        return {"replaced": replaced, "added": added, "deleted": deleted}
+
 
 def test_episode_collector_expands_long_flow_into_single_turn_steps():
     memory = _FakeMemory()
@@ -207,6 +238,42 @@ def test_episode_collector_expands_long_flow_into_single_turn_steps():
     assert trace["tasks"][0]["result"]["texts"] == ["Alice lives in Paris."]
     assert trace["tasks"][1]["result"] == "Paris"
     assert trace["steps"][1]["memory_step"]["full_memory"][0]["content"] == "Alice lives in Paris."
+
+
+def test_episode_collector_retries_malformed_patch_update():
+    memory = _FakeMemory()
+    collector = MemoryOPDEpisodeCollector(
+        memory,  # type: ignore[arg-type]
+        MAgentConfig(
+            update_protocol="patch",
+            seed_query_top_n=0,
+            max_query_rounds=1,
+            max_steps=3,
+        ),
+    )
+    episode = {
+        "schema_version": 1,
+        "episode_id": "locomo-1",
+        "source": "locomo",
+        "sessions": [{"session_index": 1, "date_time": "day 1", "input": "Alice moved."}],
+        "qa": [],
+        "metadata": {},
+    }
+    responses = iter(
+        [
+            "<update>nothing to parse</update>",
+            "<update><add>Alice lives in Paris.</add></update>",
+        ]
+    )
+
+    async def generate(step):
+        assert "Use only the stable patch protocol" not in step.force_instruction
+        return next(responses)
+
+    trace = asyncio.run(collector.collect(episode, generate))
+
+    assert [row["status"] for row in trace["steps"]] == ["invalid_update", "terminal"]
+    assert trace["tasks"][0]["result"]["additions"] == ["Alice lives in Paris."]
 
 
 def test_pure_opd_loss_does_not_require_task_reward_or_advantage(monkeypatch):
