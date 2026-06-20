@@ -20,7 +20,7 @@ from typing import Any, Mapping
 import torch
 from torch.utils.data import Dataset
 
-from verl.trainer.meminaction.RLDatasets.common import normalize_data_files
+from verl.trainer.meminaction.RLDatasets.common import normalize_data_files, to_plain_container
 from verl.trainer.meminaction.RLDatasets.schema import validate_sample
 
 
@@ -67,27 +67,52 @@ class MemoryOPDStepDataset(Dataset):
         self._load(data_files)
 
     @classmethod
-    def _extract_steps(cls, payload: Any) -> list[dict[str, Any]]:
+    def _extract_steps(cls, payload: Any, config: Any | None = None) -> list[dict[str, Any]]:
         """递归读取单 step、task trace、episode trace 或它们的列表。
 
         Collector 返回的 episode trace 同时含有嵌套 ``tasks[*].steps`` 和便于消费的顶层
         ``steps``。发现顶层 ``steps`` 后直接使用它，避免同一 step 被重复展开。
+
+        另外支持 oracle snapshot payload：
+
+        ``{"memory_episode": {...}, "oracle_session_snapshots": [...]}``
+
+        这会在 Dataset 加载阶段展开为“一条 session/QA snapshot anchor 对应一条
+        ``memory_step``”，便于直接把离线 oracle 快照文件作为 step dataset 输入。
         """
 
         # 步骤 1：列表输入逐项递归展开。
         if isinstance(payload, list):
-            return [step for item in payload for step in cls._extract_steps(item)]
+            return [step for item in payload for step in cls._extract_steps(item, config=config)]
         # 步骤 2：拒绝无法表达 trace 层级的非 mapping 值。
         if not isinstance(payload, Mapping):
             raise TypeError(f"Memory-OPD trace 必须是 dict/list，实际为 {type(payload)!r}")
         # 步骤 3：发现 memory_step 表示已到达叶子 trace record，深拷贝后返回。
         if "memory_step" in payload:
             return [copy.deepcopy(dict(payload))]
-        # 步骤 4：优先展开顶层 steps；不存在时再展开 tasks。
+        # 步骤 4：oracle snapshot 输入在 Dataset 中展开为 step trace。
+        if "memory_episode" in payload and "oracle_session_snapshots" in payload:
+            from mem_in_action.configs import MAgentConfig
+            from verl.trainer.meminaction.agentic_loop import build_oracle_memory_opd_trace
+
+            config_data = dict(to_plain_container(config) or {}) if config is not None else {}
+            controller_config_data = dict(
+                config_data.get("oracle_snapshot_controller")
+                or config_data.get("memory_opd_prompt")
+                or {}
+            )
+            trace = build_oracle_memory_opd_trace(
+                payload["memory_episode"],
+                payload["oracle_session_snapshots"],
+                config=MAgentConfig(**controller_config_data),
+                answer_memory=payload.get("answer_memory"),
+            )
+            return cls._extract_steps(trace, config=config)
+        # 步骤 5：优先展开顶层 steps；不存在时再展开 tasks。
         if "steps" in payload:
-            return cls._extract_steps(payload["steps"])
+            return cls._extract_steps(payload["steps"], config=config)
         if "tasks" in payload:
-            return cls._extract_steps(payload["tasks"])
+            return cls._extract_steps(payload["tasks"], config=config)
         raise KeyError("Memory-OPD trace 中找不到 memory_step、steps 或 tasks")
 
     @staticmethod
@@ -109,6 +134,7 @@ class MemoryOPDStepDataset(Dataset):
         # 步骤 1：复制并验证冻结 step，避免 row 与输入 trace 共享可变对象。
         memory_step = copy.deepcopy(dict(trace_step["memory_step"]))
         self._validate_step(memory_step)
+        step_metadata = copy.deepcopy(dict(memory_step.get("metadata") or {}))
         # 步骤 2：创建 VeRL 契约要求的占位 raw_prompt。
         raw_prompt = [
             {
@@ -126,6 +152,16 @@ class MemoryOPDStepDataset(Dataset):
             "phase": memory_step["phase"],
             "task_mode": memory_step["task_mode"],
             "step_index": memory_step.get("step_index", index),
+            # metadata 是 snapshot anchor 的结构化身份：第几个 session/QA、oracle
+            # snapshot 编号、以及当前样本来自 update 还是 answer。
+            "memory_step_metadata": step_metadata,
+            "session_index": step_metadata.get("session_index"),
+            "qa_index": step_metadata.get("qa_index"),
+            "date_time": step_metadata.get("date_time"),
+            "collection_mode": step_metadata.get("collection_mode"),
+            "oracle_snapshot_before_index": step_metadata.get("oracle_snapshot_before_index"),
+            "oracle_snapshot_after_index": step_metadata.get("oracle_snapshot_after_index"),
+            "oracle_snapshot_index": step_metadata.get("oracle_snapshot_index"),
             # collector action 仅用于追踪状态来源；训练时仍由当前 student 在线采样。
             "collected_action": trace_step.get("action"),
             "collected_status": trace_step.get("status"),
@@ -160,7 +196,7 @@ class MemoryOPDStepDataset(Dataset):
         """
 
         # 步骤 1：将任意受支持 trace 层级展开成叶子 step records。
-        trace_steps = self._extract_steps(trace_payload)
+        trace_steps = self._extract_steps(trace_payload, config=self.config)
         # 步骤 2：按配置确定性 shuffle。
         if self.config.get("shuffle", False):
             rng = random.Random(self.config.get("seed", 0) or 0)
@@ -191,7 +227,7 @@ class MemoryOPDStepDataset(Dataset):
             else:
                 payload = json.loads(path.read_text(encoding="utf-8"))
             # 步骤 3：递归提取当前文件的叶子 step，并追加到总 buffer。
-            trace_steps.extend(self._extract_steps(payload))
+            trace_steps.extend(self._extract_steps(payload, config=self.config))
         # 步骤 4：统一执行 shuffle、截断和 row 包装。
         self.replace_steps(trace_steps)
 

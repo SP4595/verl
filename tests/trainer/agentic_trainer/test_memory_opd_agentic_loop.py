@@ -7,10 +7,11 @@ import torch
 
 from mem_in_action.configs import MAgentConfig
 from verl.trainer.distillation import losses as distillation_losses
-from verl.trainer.agentic_trainer.agentic_loop import (
+from verl.trainer.meminaction.agentic_loop import (
     MemoryOPDEpisodeCollector,
     MemoryOPDPromptRenderer,
     MemoryOPDStep,
+    build_oracle_memory_opd_trace,
     iter_memory_episode_tasks,
     parse_memory_action,
     visible_memory_response_text,
@@ -274,6 +275,61 @@ def test_episode_collector_retries_malformed_patch_update():
 
     assert [row["status"] for row in trace["steps"]] == ["invalid_update", "terminal"]
     assert trace["tasks"][0]["result"]["additions"] == ["Alice lives in Paris."]
+
+
+def test_oracle_snapshot_builder_creates_independent_terminal_steps():
+    episode = {
+        "schema_version": 1,
+        "episode_id": "locomo-1",
+        "source": "locomo",
+        "sessions": [
+            {"session_index": 1, "date_time": "day 1", "input": "Alice moved to Paris."},
+            {"session_index": 2, "date_time": "day 2", "input": "Alice adopted a cat."},
+        ],
+        "qa": [
+            {
+                "qa_index": 0,
+                "question": "Where does Alice live?",
+                "answer": "Paris",
+                "category": 1,
+                "evidence": [],
+            }
+        ],
+        "metadata": {},
+    }
+
+    trace = build_oracle_memory_opd_trace(
+        episode,
+        oracle_session_snapshots=[
+            [{"content": "Alice lives in Paris."}],
+            [
+                {"content": "Alice lives in Paris."},
+                {"content": "Alice has a cat."},
+            ],
+        ],
+        config=MAgentConfig(update_protocol="patch"),
+    )
+
+    assert trace["collection_mode"] == "oracle_snapshot"
+    assert [row["action"] for row in trace["steps"]] == ["update", "update", "answer"]
+    assert [row["memory_step"]["allowed_actions"] for row in trace["steps"]] == [
+        ["update"],
+        ["update"],
+        ["answer"],
+    ]
+    second_update = trace["steps"][1]["memory_step"]
+    assert second_update["metadata"]["task_mode"] == "update"
+    assert second_update["metadata"]["phase"] == "memory_creation"
+    assert second_update["memory_cache"][0]["content"] == "Alice lives in Paris."
+    assert [row["content"] for row in second_update["full_memory"]] == [
+        "Alice lives in Paris.",
+        "Alice has a cat.",
+    ]
+    answer_step = trace["steps"][2]["memory_step"]
+    assert answer_step["metadata"]["task_mode"] == "answer"
+    assert answer_step["metadata"]["phase"] == "qa"
+    assert answer_step["memory_cache"] == answer_step["full_memory"]
+    assert answer_step["metadata"]["answer"] == "Paris"
 
 
 def test_pure_opd_loss_does_not_require_task_reward_or_advantage(monkeypatch):

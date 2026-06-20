@@ -240,6 +240,236 @@ def _serialize_memory_rows(rows: list[Any]) -> list[dict[str, Any]]:
     return serialized
 
 
+def _normalize_oracle_memory_rows(rows: list[Any] | tuple[Any, ...] | None) -> list[dict[str, Any]]:
+    """规范化 oracle 生成的 memory snapshot，使其可直接作为 Cache/full-memory。
+
+    Oracle snapshot 通常来自离线 privileged 模型，可能是字符串列表，也可能是
+    ``{"content": ...}``/``{"text": ...}`` 字典列表。这里为每条非空 memory 补齐
+    student 可见 ``vid`` 和 teacher 可读 ``rid``，从而无需真实 RAG 后端也能构造
+    ``MemoryOPDStep``。
+    """
+
+    # 步骤 1：空 snapshot 合法，表示当前没有长期 memory。
+    if rows is None:
+        return []
+    if not isinstance(rows, (list, tuple)):
+        raise TypeError(f"oracle memory snapshot 必须是 list/tuple，实际为 {type(rows)!r}")
+
+    # 步骤 2：逐条保留已有元数据，同时把 content/text/string 统一成 content 字段。
+    normalized: list[dict[str, Any]] = []
+    for row in rows:
+        if isinstance(row, Mapping):
+            item = copy.deepcopy(dict(row))
+        elif isinstance(row, str):
+            item = {"content": row}
+        else:
+            item = {
+                "vid": getattr(row, "vid", None),
+                "rid": getattr(row, "rid", None),
+                "content": str(getattr(row, "content", "") or ""),
+                "score": getattr(row, "score", None),
+                "metadata": copy.deepcopy(getattr(row, "metadata", {}) or {}),
+            }
+
+        content = _memory_content(item)
+        if not content:
+            continue
+        item["content"] = content
+        # 步骤 3：补齐 Cache 可见 ID 和完整 memory 稳定 ID。
+        if item.get("vid") is None:
+            item["vid"] = len(normalized) + 1
+        if item.get("rid") is None and item.get("memory_id") is None:
+            item["rid"] = f"oracle_{len(normalized) + 1:06d}"
+        normalized.append(item)
+
+    # 步骤 4：返回与活跃对象解耦的普通 Python 容器。
+    return normalized
+
+
+def _terminal_force_instruction(config: MAgentConfig, task_mode: MemoryTaskMode) -> str:
+    """返回无需继续 query 时写入 prompt 的 terminal 指令。"""
+
+    if task_mode == "update":
+        if config.update_protocol == "patch":
+            return config.force_patch_update_instruction
+        return config.force_update_instruction
+    return config.force_answer_instruction
+
+
+def _oracle_snapshot_pairs(
+    oracle_session_snapshots: list[Any] | tuple[Any, ...],
+    num_sessions: int,
+) -> list[tuple[list[dict[str, Any]], list[dict[str, Any]]]]:
+    """把每个 session 的 oracle snapshot 转成 ``(before, after)`` 序列。
+
+    支持两种输入：
+
+    - 长度等于 session 数：第一个 session 的 before 默认为空；
+    - 长度等于 session 数 + 1：第 0 个 snapshot 显式表示初始 memory。
+    """
+
+    snapshots = list(oracle_session_snapshots)
+    if len(snapshots) == num_sessions:
+        normalized = [[]] + [_normalize_oracle_memory_rows(snapshot) for snapshot in snapshots]
+    elif len(snapshots) == num_sessions + 1:
+        normalized = [_normalize_oracle_memory_rows(snapshot) for snapshot in snapshots]
+    else:
+        raise ValueError(
+            "oracle_session_snapshots 长度必须等于 sessions 数或 sessions 数 + 1；"
+            f"实际 snapshots={len(snapshots)}, sessions={num_sessions}"
+        )
+    return list(zip(normalized[:-1], normalized[1:], strict=True))
+
+
+def build_oracle_memory_opd_trace(
+    memory_episode: Mapping[str, Any],
+    oracle_session_snapshots: list[Any] | tuple[Any, ...],
+    *,
+    config: MAgentConfig | None = None,
+    answer_memory: list[Any] | tuple[Any, ...] | None = None,
+) -> dict[str, Any]:
+    """用离线 oracle memory 快照直接构造 single-turn Memory-OPD steps。
+
+    这条路径绕过 ``MemoryOPDEpisodeCollector`` 的完整 student trajectory rollout：
+
+    - update step：student 只看上一个 session 的 oracle snapshot 作为 Cache；
+      privileged teacher 的 ``full_memory`` 是当前 session 更新后的 oracle target；
+    - answer step：student 直接看最终 oracle memory snapshot，然后只允许 ``answer``。
+
+    因此每个 session/QA 都变成一个 terminal single-turn step，不再需要 query/update/
+    answer 串行推进完整轨迹。返回结构仍兼容 ``MemoryOPDStepDataset``。
+    """
+
+    # 步骤 1：验证 episode，并准备全局配置与 oracle snapshot 对。
+    validate_memory_episode(memory_episode)
+    controller_config = config or MAgentConfig()
+    sessions = memory_episode["sessions"]
+    normalized_snapshots = [
+        _normalize_oracle_memory_rows(snapshot)
+        for snapshot in list(oracle_session_snapshots)
+    ]
+    snapshot_pairs = _oracle_snapshot_pairs(oracle_session_snapshots, len(sessions))
+    final_oracle_memory = (
+        _normalize_oracle_memory_rows(answer_memory)
+        if answer_memory is not None
+        else (
+            copy.deepcopy(snapshot_pairs[-1][1])
+            if snapshot_pairs
+            else copy.deepcopy(normalized_snapshots[-1] if normalized_snapshots else [])
+        )
+    )
+
+    # 步骤 2：逐 session 构造 update anchor。Cache 是 before，teacher target 是 after。
+    tasks: list[dict[str, Any]] = []
+    flat_steps: list[dict[str, Any]] = []
+    for session_index, (session, (before_memory, after_memory)) in enumerate(
+        zip(sessions, snapshot_pairs, strict=True),
+        start=1,
+    ):
+        task = {
+            "episode_id": memory_episode["episode_id"],
+            "phase": "memory_creation",
+            "task_mode": "update",
+            "current_input": session["input"],
+            "metadata": {
+                "phase": "memory_creation",
+                "task_mode": "update",
+                "session_index": session.get("session_index", session_index),
+                "date_time": session.get("date_time", ""),
+                "collection_mode": "oracle_snapshot",
+                "oracle_snapshot_before_index": session_index - 1,
+                "oracle_snapshot_after_index": session_index,
+                "oracle_memory_before_size": len(before_memory),
+                "oracle_memory_after_size": len(after_memory),
+            },
+        }
+        step = MemoryOPDStep(
+            episode_id=task["episode_id"],
+            phase="memory_creation",
+            task_mode="update",
+            current_input=task["current_input"],
+            memory_cache=copy.deepcopy(before_memory),
+            full_memory=copy.deepcopy(after_memory),
+            force_instruction=_terminal_force_instruction(controller_config, "update"),
+            allowed_actions=["update"],
+            step_index=0,
+            metadata=copy.deepcopy(task["metadata"]),
+        )
+        record = {
+            "memory_step": step.as_dict(),
+            "response_text": "",
+            "action": "update",
+            "payload": "",
+            "status": "oracle_anchor",
+        }
+        tasks.append(
+            {
+                "task": task,
+                "steps": [record],
+                "result": {
+                    "oracle_memory_before_size": len(before_memory),
+                    "oracle_memory_after_size": len(after_memory),
+                },
+                "final_memory": copy.deepcopy(after_memory),
+            }
+        )
+        flat_steps.append(record)
+
+    # 步骤 3：每个 QA 构造 answer anchor。Answer 不需要 privileged hidden memory。
+    for qa in memory_episode["qa"]:
+        task = {
+            "episode_id": memory_episode["episode_id"],
+            "phase": "qa",
+            "task_mode": "answer",
+            "current_input": qa["question"],
+            "metadata": {
+                **copy.deepcopy(dict(qa)),
+                "phase": "qa",
+                "task_mode": "answer",
+                "collection_mode": "oracle_snapshot",
+                "oracle_snapshot_index": len(sessions),
+                "oracle_answer_memory_size": len(final_oracle_memory),
+            },
+        }
+        step = MemoryOPDStep(
+            episode_id=task["episode_id"],
+            phase="qa",
+            task_mode="answer",
+            current_input=task["current_input"],
+            memory_cache=copy.deepcopy(final_oracle_memory),
+            full_memory=copy.deepcopy(final_oracle_memory),
+            force_instruction=_terminal_force_instruction(controller_config, "answer"),
+            allowed_actions=["answer"],
+            step_index=0,
+            metadata=copy.deepcopy(task["metadata"]),
+        )
+        record = {
+            "memory_step": step.as_dict(),
+            "response_text": "",
+            "action": "answer",
+            "payload": "",
+            "status": "oracle_anchor",
+        }
+        tasks.append(
+            {
+                "task": task,
+                "steps": [record],
+                "result": qa.get("answer"),
+                "final_memory": copy.deepcopy(final_oracle_memory),
+            }
+        )
+        flat_steps.append(record)
+
+    # 步骤 4：保持 Collector trace 兼容结构，供 MemoryOPDStepDataset 直接展开。
+    return {
+        "episode_id": memory_episode["episode_id"],
+        "collection_mode": "oracle_snapshot",
+        "tasks": tasks,
+        "steps": flat_steps,
+        "final_memory": final_oracle_memory,
+    }
+
+
 @dataclass(slots=True)
 class MemoryOPDStep:
     """一个可独立训练的 Memory Controller 决策状态。
@@ -455,17 +685,35 @@ class MemoryOPDPromptRenderer:
             return messages
 
         # 步骤 3：为 query/update 构造 teacher-only 规则和完整长期 memory。
+        is_oracle_update = (
+            action == "update"
+            and isinstance(step.metadata, Mapping)
+            and step.metadata.get("collection_mode") == "oracle_snapshot"
+        )
+        if is_oracle_update:
+            memory_label = "Oracle Target Long-Term Memory after this update (teacher only)"
+            memory_rule = (
+                "- The target memory below is the desired state after applying Current Input to the "
+                "visible Cache.\n"
+                "- Score updates by whether they move the visible Cache toward this target while using "
+                "only information justified by Current Input and visible Cache.\n"
+            )
+        else:
+            memory_label = "Complete Long-Term Memory (teacher only)"
+            memory_rule = (
+                "- Use complete memory to judge which missing information should be retrieved next and "
+                "whether the visible Cache is sufficient for a correct update.\n"
+            )
         privileged_block = (
             "\n\nPrivileged OPD teacher view:\n"
-            "- The student cannot see the Complete Long-Term Memory below.\n"
+            f"- The student cannot see the {memory_label} below.\n"
             "- Evaluate the same sampled response under the same action protocol.\n"
-            "- Use complete memory to judge which missing information should be retrieved next and "
-            "whether the visible Cache is sufficient for a correct update.\n"
+            f"{memory_rule}"
             "- A query should retrieve useful hidden memory into Cache. An update may reference only "
             "visible Cache IDs and must obey the student update protocol.\n"
             "- Do not copy hidden memory directly into an action that the student could not justify "
             "from Current Input and visible Cache.\n\n"
-            "Complete Long-Term Memory (teacher only):\n"
+            f"{memory_label}:\n"
             f"{_render_full_memory(step.full_memory)}"
         )
         # 步骤 4：定位已有 system message；不存在时创建一个。
@@ -968,6 +1216,7 @@ __all__ = [
     "MemoryOPDStepAgentLoop",
     "PrivilegeOPDAgentLoopManager",
     "PrivilegeOPDAgentLoopWorker",
+    "build_oracle_memory_opd_trace",
     "iter_memory_episode_tasks",
     "parse_memory_action",
     "visible_memory_response_text",

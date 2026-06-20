@@ -2,9 +2,15 @@
 """Collect offline Memory-OPD step traces from LoCoMo episodes.
 
 This is the bridge between the episode-level LoCoMo source and the step-level
-``MemoryOPDStepDataset`` used by the current pure OPD trainer. It runs the
-Mem-In-Action state machine once, records every frozen decision state, and writes
-one collector step record per JSONL line.
+``MemoryOPDStepDataset`` used by the current pure OPD trainer.
+
+Two collection modes are supported:
+
+- ``trajectory`` runs the Mem-In-Action state machine once and records every
+  frozen decision state.
+- ``oracle_snapshot`` asks a privileged model to produce one canonical memory
+  snapshot after each session, then creates one terminal update step per session
+  and one terminal answer step per QA without rolling out the full trajectory.
 """
 
 from __future__ import annotations
@@ -16,7 +22,7 @@ import os
 import sys
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from omegaconf import OmegaConf
 
@@ -66,6 +72,94 @@ def _messages_to_prompt(messages: list[dict[str, str]]):
         system_prompt="\n\n".join(system_parts) or None,
         user_prompt="\n\n".join(user_parts) or None,
     )
+
+
+def _first_json_payload(text: str) -> Any:
+    decoder = json.JSONDecoder()
+    for start, char in enumerate(text):
+        if char not in "[{":
+            continue
+        try:
+            payload, _ = decoder.raw_decode(text[start:])
+            return payload
+        except json.JSONDecodeError:
+            continue
+    raise ValueError("oracle snapshot response did not contain a JSON object or array")
+
+
+def _parse_oracle_memory_snapshot(text: str) -> list[dict[str, Any]]:
+    payload = _first_json_payload(text.strip())
+    if isinstance(payload, Mapping):
+        for key in ("memories", "memory", "entries", "snapshot"):
+            if key in payload:
+                payload = payload[key]
+                break
+    if not isinstance(payload, list):
+        raise TypeError(f"oracle snapshot must be a JSON list, got {type(payload)!r}")
+
+    rows: list[dict[str, Any]] = []
+    for index, item in enumerate(payload, start=1):
+        if isinstance(item, str):
+            content = item.strip()
+            row = {"content": content}
+        elif isinstance(item, Mapping):
+            row = dict(item)
+            content = str(row.get("content") or row.get("text") or "").strip()
+            row["content"] = content
+        else:
+            raise TypeError(f"oracle snapshot entry {index} must be string or object, got {type(item)!r}")
+        if content:
+            rows.append(row)
+    return rows
+
+
+def _oracle_snapshot_messages(
+    episode: Mapping[str, Any],
+    session: Mapping[str, Any],
+    previous_snapshot: list[dict[str, Any]],
+) -> list[dict[str, str]]:
+    previous_json = json.dumps(previous_snapshot, ensure_ascii=False, indent=2)
+    return [
+        {
+            "role": "system",
+            "content": (
+                "You are an omniscient memory curator for a long-dialogue Memory RAG system. "
+                "No Memory Cache or retrieval tool is available. Build the complete canonical "
+                "long-term memory state directly from the previous oracle snapshot and the current session."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"Episode id: {episode['episode_id']}\n\n"
+                "Previous oracle memory snapshot (complete state, not a cache):\n"
+                f"{previous_json}\n\n"
+                "Current session:\n"
+                f"{session['input']}\n\n"
+                "Return JSON only. Use this schema exactly:\n"
+                '{"memories":[{"content":"self-contained atomic memory"}]}\n\n'
+                "Rules:\n"
+                "- Preserve still-valid prior memories.\n"
+                "- Add new durable facts from the current session.\n"
+                "- Merge duplicates and update contradictions when the current session makes them clear.\n"
+                "- Do not include commentary, markdown, hidden thoughts, or answer text."
+            ),
+        },
+    ]
+
+
+def _generate_oracle_session_snapshots(
+    episode: Mapping[str, Any],
+    llm: Any,
+) -> list[list[dict[str, Any]]]:
+    snapshots: list[list[dict[str, Any]]] = []
+    previous_snapshot: list[dict[str, Any]] = []
+    for session in episode["sessions"]:
+        messages = _oracle_snapshot_messages(episode, session, previous_snapshot)
+        raw = str(llm.complete_chat(_messages_to_prompt(messages)))
+        previous_snapshot = _parse_oracle_memory_snapshot(raw)
+        snapshots.append(previous_snapshot)
+    return snapshots
 
 
 def _build_episode_dataset(args: argparse.Namespace):
@@ -159,18 +253,23 @@ def _build_llm(args: argparse.Namespace):
 
 
 async def _collect(args: argparse.Namespace) -> dict[str, int]:
-    from verl.trainer.meminaction.agentic_loop import MemoryOPDEpisodeCollector, MemoryOPDPromptRenderer
-
     dataset = _build_episode_dataset(args)
     if args.dry_run:
         sessions = sum(len(row["memory_episode"]["sessions"]) for row in dataset)
         qa = sum(len(row["memory_episode"]["qa"]) for row in dataset)
-        return {"episodes": len(dataset), "tasks": sessions + qa, "steps": 0}
+        estimated_steps = sessions + qa if args.collection_mode == "oracle_snapshot" else 0
+        return {"episodes": len(dataset), "tasks": sessions + qa, "steps": estimated_steps}
+
+    from verl.trainer.meminaction.agentic_loop import (
+        MemoryOPDEpisodeCollector,
+        MemoryOPDPromptRenderer,
+        build_oracle_memory_opd_trace,
+    )
 
     args.out_file.parent.mkdir(parents=True, exist_ok=True)
     controller_config = _build_controller_config(args)
-    renderer = MemoryOPDPromptRenderer(controller_config)
     llm = _build_llm(args)
+    renderer = MemoryOPDPromptRenderer(controller_config) if args.collection_mode == "trajectory" else None
 
     episodes = 0
     steps = 0
@@ -178,14 +277,23 @@ async def _collect(args: argparse.Namespace) -> dict[str, int]:
     with args.out_file.open("w", encoding="utf-8") as handle:
         for row in dataset:
             episode = row["memory_episode"]
-            memory = _build_memory(args, episode["episode_id"])
-            collector = MemoryOPDEpisodeCollector(memory=memory, config=controller_config)
+            if args.collection_mode == "trajectory":
+                assert renderer is not None
+                memory = _build_memory(args, episode["episode_id"])
+                collector = MemoryOPDEpisodeCollector(memory=memory, config=controller_config)
 
-            async def generate_step(step):
-                messages = renderer.render_student_messages(step)
-                return str(llm.complete_chat(_messages_to_prompt(messages)))
+                async def generate_step(step):
+                    messages = renderer.render_student_messages(step)
+                    return str(llm.complete_chat(_messages_to_prompt(messages)))
 
-            trace = await collector.collect(episode, generate_step)
+                trace = await collector.collect(episode, generate_step)
+            else:
+                oracle_session_snapshots = _generate_oracle_session_snapshots(episode, llm)
+                trace = build_oracle_memory_opd_trace(
+                    episode,
+                    oracle_session_snapshots,
+                    config=controller_config,
+                )
             episodes += 1
             tasks += len(trace["tasks"])
             for step_record in trace["steps"]:
@@ -212,6 +320,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--shuffle", action="store_true")
     parser.add_argument("--dry-run", action="store_true", help="Only load and count episodes; do not call services.")
     parser.add_argument("--quiet", action="store_true")
+    parser.add_argument(
+        "--collection-mode",
+        choices=["trajectory", "oracle_snapshot"],
+        default="trajectory",
+        help="trajectory rolls out the full state machine; oracle_snapshot builds one anchored step per session/QA.",
+    )
 
     parser.add_argument("--llm-model", default=os.getenv("MIA_LLM_MODEL", "qwen3.6:35b"))
     parser.add_argument("--llm-base-url", default=os.getenv("MIA_LLM_BASE_URL", "http://127.0.0.1:11434/v1"))
@@ -261,15 +375,15 @@ def main() -> None:
     if args.dry_run:
         print(
             f"dry-run: episodes={summary['episodes']} tasks={summary['tasks']} "
-            "steps=0"
+            f"estimated_steps={summary['steps']} mode={args.collection_mode}"
         )
     else:
         print(
             f"wrote {summary['steps']} steps from {summary['tasks']} tasks "
-            f"across {summary['episodes']} episodes to {args.out_file}"
+            f"across {summary['episodes']} episodes to {args.out_file} "
+            f"(mode={args.collection_mode})"
         )
 
 
 if __name__ == "__main__":
     main()
-

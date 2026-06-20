@@ -5,12 +5,12 @@ from omegaconf import OmegaConf
 from torch.utils.data import Dataset
 
 from verl import DataProto
-from verl.trainer.agentic_trainer.RLDatasets import (
+from verl.trainer.meminaction.RLDatasets import (
     MemoryOPDStepDataset,
     PRIVILEGE_OPD_SAMPLE_KEYS,
     PrivilegeOPDDataset,
-    privilege_opd_dataset,
 )
+from verl.trainer.meminaction.RLDatasets import privilege_opd_dataset
 from verl.utils.dataset.rl_dataset import collate_fn
 
 
@@ -229,9 +229,16 @@ def test_memory_opd_step_dataset_flattens_collector_trace(tmp_path):
                             "memory_cache": [],
                             "full_memory": [],
                             "step_index": 0,
+                            "metadata": {
+                                "session_index": 1,
+                                "date_time": "day 1",
+                                "collection_mode": "oracle_snapshot",
+                                "oracle_snapshot_before_index": 0,
+                                "oracle_snapshot_after_index": 1,
+                            },
                         },
                         "action": "update",
-                        "status": "terminal",
+                        "status": "oracle_anchor",
                     },
                     {
                         "memory_step": {
@@ -242,9 +249,15 @@ def test_memory_opd_step_dataset_flattens_collector_trace(tmp_path):
                             "memory_cache": [{"vid": 1, "content": "Alice lives in Paris."}],
                             "full_memory": [{"rid": "m1", "content": "Alice lives in Paris."}],
                             "step_index": 0,
+                            "metadata": {
+                                "qa_index": 0,
+                                "answer": "Paris",
+                                "collection_mode": "oracle_snapshot",
+                                "oracle_snapshot_index": 1,
+                            },
                         },
                         "action": "answer",
-                        "status": "terminal",
+                        "status": "oracle_anchor",
                     },
                 ],
             }
@@ -263,3 +276,8 @@ def test_memory_opd_step_dataset_flattens_collector_trace(tmp_path):
     assert dataset[0]["agent_name"] == "memory_opd_step"
     assert dataset[1]["memory_step"]["task_mode"] == "answer"
     assert dataset[1]["extra_info"]["collected_action"] == "answer"
+    assert dataset[0]["extra_info"]["session_index"] == 1
+    assert dataset[0]["extra_info"]["collection_mode"] == "oracle_snapshot"
+    assert dataset[0]["extra_info"]["oracle_snapshot_after_index"] == 1
+    assert dataset[1]["extra_info"]["qa_index"] == 0
+    assert dataset[1]["extra_info"]["oracle_snapshot_index"] == 1
