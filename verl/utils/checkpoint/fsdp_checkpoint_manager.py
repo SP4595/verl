@@ -30,7 +30,7 @@ from transformers.dynamic_module_utils import custom_object_save
 
 from verl.utils.device import is_cuda_available
 from verl.utils.fs import copy_to_local, is_non_local, local_mkdir_safe
-from verl.utils.fsdp_utils import fsdp_version, get_fsdp_full_state_dict, get_fsdp_state_ctx
+from verl.utils.fsdp_utils import collect_lora_params, fsdp_version, get_fsdp_full_state_dict, get_fsdp_state_ctx
 from verl.utils.logger import log_with_rank
 from verl.utils.transformers_compat import drop_tied_target_keys, get_auto_model_for_vision2seq
 
@@ -284,14 +284,15 @@ class FSDPCheckpointManager(BaseCheckpointManager):
                     torch.save(extra_state_dict, extra_path)
                     log_with_rank(f"Saved extra_state to {os.path.abspath(extra_path)}", rank=self.rank, logger=logger)
 
+        if fsdp_version(self.model) == 1:
+            unwrap_model = self.model._fsdp_wrapped_module
+        else:
+            unwrap_model = self.model
+        has_peft_adapter = getattr(unwrap_model, "peft_config", None) is not None
+
         if self.rank == 0:
             # Save HF tokenizer/processor and model config on rank 0 to huggingface/ directory, no matter whether
             # huggingface model is requested to be saved or not.
-
-            if fsdp_version(self.model) == 1:
-                unwrap_model = self.model._fsdp_wrapped_module
-            else:
-                unwrap_model = self.model
 
             hf_config_tokenizer_path = os.path.join(local_path, "huggingface")
             local_mkdir_safe(hf_config_tokenizer_path)
@@ -339,54 +340,67 @@ class FSDPCheckpointManager(BaseCheckpointManager):
         torch.distributed.barrier()
 
         if self.should_save_hf_model:
-            # Only rank 0 will save hf model and,
-            # offload to cpu to save LLMs which may be too large to fit in one GPU
-            state_dict = get_fsdp_full_state_dict(self.model, offload_to_cpu=True, rank0_only=True)
+            hf_local_path = os.path.join(local_path, "huggingface")
+            if has_peft_adapter:
+                state_dict = collect_lora_params(self.model, layered_summon=False, base_sync_done=True)
 
-            if self.rank == 0:
-                hf_local_path = os.path.join(local_path, "huggingface")
-                os.makedirs(hf_local_path, exist_ok=True)
-
-                if "ForTokenClassification" in model_config.architectures[0]:
-                    from transformers import AutoModelForTokenClassification
-
-                    auto_model_cls = AutoModelForTokenClassification
-                elif "ForCausalLM" in model_config.architectures[0]:
-                    from transformers import AutoModelForCausalLM
-
-                    auto_model_cls = AutoModelForCausalLM
-                elif "ForConditionalGeneration" in model_config.architectures[0]:
-                    auto_model_cls = get_auto_model_for_vision2seq()
-                else:
-                    raise NotImplementedError(f"Unknown architecture {model_config['architectures']}")
-
-                with init_empty_weights():
-                    save_model = auto_model_cls.from_config(
-                        model_config, torch_dtype=torch.bfloat16, trust_remote_code=self.trust_remote_code
+                if self.rank == 0:
+                    os.makedirs(hf_local_path, exist_ok=True)
+                    unwrap_model.save_pretrained(hf_local_path, state_dict=state_dict, safe_serialization=True)
+                    log_with_rank(
+                        f"Saved LoRA adapter hf_model to {os.path.abspath(hf_local_path)}",
+                        rank=self.rank,
+                        logger=logger,
+                        log_only_rank_0=True,
                     )
+                del state_dict
+            else:
+                # Only rank 0 will save hf model and,
+                # offload to cpu to save LLMs which may be too large to fit in one GPU
+                state_dict = get_fsdp_full_state_dict(self.model, offload_to_cpu=True, rank0_only=True)
 
-                save_model.to_empty(device="cpu")
+                if self.rank == 0:
+                    os.makedirs(hf_local_path, exist_ok=True)
+                    if "ForTokenClassification" in model_config.architectures[0]:
+                        from transformers import AutoModelForTokenClassification
 
-                if save_model.can_generate():
-                    if generation_config is not None:
-                        save_model.generation_config = generation_config
+                        auto_model_cls = AutoModelForTokenClassification
+                    elif "ForCausalLM" in model_config.architectures[0]:
+                        from transformers import AutoModelForCausalLM
+
+                        auto_model_cls = AutoModelForCausalLM
+                    elif "ForConditionalGeneration" in model_config.architectures[0]:
+                        auto_model_cls = get_auto_model_for_vision2seq()
                     else:
-                        print(
-                            f"Warning: {self.__class__.__name__}.save_checkpoint: Generation config file not found "
-                            f"in, using a generation config created from the model config when saving hf_model."
+                        raise NotImplementedError(f"Unknown architecture {model_config['architectures']}")
+
+                    with init_empty_weights():
+                        save_model = auto_model_cls.from_config(
+                            model_config, torch_dtype=torch.bfloat16, trust_remote_code=self.trust_remote_code
                         )
 
-                drop_tied_target_keys(state_dict, save_model, model_config)
+                    save_model.to_empty(device="cpu")
 
-                save_model.save_pretrained(hf_local_path, state_dict=state_dict)
-                log_with_rank(
-                    f"Saved hf_model to {os.path.abspath(hf_local_path)}",
-                    rank=self.rank,
-                    logger=logger,
-                    log_only_rank_0=True,
-                )
+                    if save_model.can_generate():
+                        if generation_config is not None:
+                            save_model.generation_config = generation_config
+                        else:
+                            print(
+                                f"Warning: {self.__class__.__name__}.save_checkpoint: Generation config file not found "
+                                f"in, using a generation config created from the model config when saving hf_model."
+                            )
+
+                    drop_tied_target_keys(state_dict, save_model, model_config)
+
+                    save_model.save_pretrained(hf_local_path, state_dict=state_dict, safe_serialization=True)
+                    log_with_rank(
+                        f"Saved hf_model to {os.path.abspath(hf_local_path)}",
+                        rank=self.rank,
+                        logger=logger,
+                        log_only_rank_0=True,
+                    )
+                    del save_model
                 del state_dict
-                del save_model
 
             # wait for rank0 to dump hf_model to local
             torch.distributed.barrier()
