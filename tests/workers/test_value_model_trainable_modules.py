@@ -100,3 +100,35 @@ def test_lora_filter_keeps_adapter_and_value_head_trainable():
     assert any("classifier" in name for name in trainable)
     assert all("lora_" in name or "classifier" in name for name in trainable)
     assert not any("original_module" in name for name in trainable)
+
+
+def test_all_linear_lora_excludes_value_head_before_token_cls_wrap():
+    """生产配置的 all-linear 不能先把 value head 包成 LoRA，否则 TOKEN_CLS 无法保存该 head。"""
+
+    engine = FSDPEngine.__new__(FSDPEngine)
+    engine.model_config = SimpleNamespace(
+        model_type="value_model",
+        lora_adapter_path=None,
+        lora_rank=2,
+        lora_alpha=4,
+        target_modules="all-linear",
+        target_parameters=None,
+        exclude_modules=r".*(classifier|score|v_head).*",
+        trainable_modules=["classifier"],
+    )
+    model = BertForTokenClassification(
+        BertConfig(
+            hidden_size=16,
+            intermediate_size=32,
+            num_attention_heads=2,
+            num_hidden_layers=1,
+            num_labels=1,
+        )
+    )
+
+    filtered = engine._apply_trainable_module_filter(engine._build_lora_module(model))
+    trainable = {name for name, parameter in filtered.named_parameters() if parameter.requires_grad}
+
+    assert any("lora_" in name for name in trainable)
+    assert any("classifier.modules_to_save" in name for name in trainable)
+    assert not any("classifier.lora_" in name for name in trainable)
