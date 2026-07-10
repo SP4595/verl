@@ -128,6 +128,9 @@ class HFModelConfig(BaseConfig):
 
     exclude_modules: Optional[str] = None
 
+    # 非空时只解冻名称或后缀匹配的模块；LoRA 模式还会保留 PEFT 已标记可训练的 adapter。
+    trainable_modules: Optional[list[str]] = None
+
     # megatron lora config
     lora: dict[str, Any] = field(default_factory=dict)
 

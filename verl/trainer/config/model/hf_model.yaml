@@ -51,6 +51,9 @@ target_modules: all-linear
 # Exclude modules from LoRA adaptation
 exclude_modules: null
 
+# 可选的模块名称或后缀；LoRA 模式保留 adapter，并额外解冻这些模块
+trainable_modules: null
+
 # Path to pre-trained LoRA adapter to load for continued training
 lora_adapter_path: null
 

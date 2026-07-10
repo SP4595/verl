@@ -306,6 +306,9 @@ class FSDPEngine(BaseEngine):
 
     def _build_lora_module(self, module):
         module.enable_input_require_grads()
+        # actor 是 causal LM；critic 是 token-level value model。若 critic 错用 CAUSAL_LM，PEFT
+        # 可能按生成模型规则寻找/保存输出头，导致标量 value head 没有被正确保留。
+        task_type = TaskType.TOKEN_CLS if self.model_config.model_type == "value_model" else TaskType.CAUSAL_LM
 
         lora_adapter_path = getattr(self.model_config, "lora_adapter_path", None)
         if lora_adapter_path is not None:
@@ -321,11 +324,11 @@ class FSDPEngine(BaseEngine):
             peft_config = module.peft_config["default"]
             # Ensure task_type is TaskType enum, not string
             if isinstance(peft_config.task_type, str):
-                peft_config.task_type = TaskType.CAUSAL_LM
+                peft_config.task_type = task_type
         else:
             # Convert config to regular Python types before creating PEFT model
             lora_config = {
-                "task_type": TaskType.CAUSAL_LM,
+                "task_type": task_type,
                 "r": self.model_config.lora_rank,
                 "lora_alpha": self.model_config.lora_alpha,
                 "target_modules": convert_to_regular_types(self.model_config.target_modules),
@@ -335,6 +338,48 @@ class FSDPEngine(BaseEngine):
             }
             module = get_peft_model(module, LoraConfig(**lora_config))
 
+        return module
+
+    def _apply_trainable_module_filter(self, module):
+        """按配置冻结基模并解冻目标模块；LoRA 模式同时保留 adapter。"""
+
+        module_names = self.model_config.trainable_modules
+        if not module_names:
+            # full critic 或普通 actor 不配置过滤器，直接沿用模型当前 requires_grad 状态。
+            return module
+
+        # PEFT 构造结束后已经精确标出 adapter/modules_to_save。先记住这批参数，再整体冻结；
+        # lora critic 最终训练“adapter + value head”，head_only 的 rank=0 则不会保留任何底座参数。
+        preserve_existing = getattr(self.model_config, "lora_rank", 0) > 0
+        preserved_parameters = {
+            name for name, parameter in module.named_parameters() if preserve_existing and parameter.requires_grad
+        }
+        # 先整体冻结，保证 head_only 不会因模型默认 requires_grad=True 泄漏到底座参数。
+        module.requires_grad_(False)
+        matched: list[str] = []
+        for name, child in module.named_modules():
+            if any(name == target or name.endswith(f".{target}") for target in module_names):
+                # 同时支持完整名称和常见后缀，兼容不同 HF value model 的 score/classifier/v_head 命名。
+                # TOKEN_CLS PEFT 可能已把 head 包成 ModulesToSaveWrapper。此时只恢复 wrapper 中原本
+                # 可训练的副本，不解冻 original_module；若 PEFT 没处理该 head，才整体解冻目标模块。
+                head_already_preserved = any(
+                    parameter_name == name or parameter_name.startswith(f"{name}.")
+                    for parameter_name in preserved_parameters
+                )
+                if not head_already_preserved:
+                    child.requires_grad_(True)
+                matched.append(name)
+        for name, parameter in module.named_parameters():
+            if name in preserved_parameters:
+                parameter.requires_grad_(True)
+        if not matched:
+            # 配错 head 名称时必须启动失败，不能静默得到一个零可训练参数的 critic。
+            raise ValueError(f"No modules matched trainable_modules={module_names!r}")
+        logger.info(
+            "Trainable module filter matched modules=%s preserved_adapter_parameters=%s",
+            sorted(set(matched)),
+            len(preserved_parameters),
+        )
         return module
 
     def _build_fsdp_module(self, module):
@@ -548,6 +593,7 @@ class FSDPEngine(BaseEngine):
         # Apply LoRA adapters if low-rank adaptation is enabled
         if self._is_lora:
             module = self._build_lora_module(module)
+        module = self._apply_trainable_module_filter(module)
 
         # Apply QAT before FSDP wrapping (training only)
         if self._qat_enabled and not self.engine_config.forward_only:
