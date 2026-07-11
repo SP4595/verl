@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
 import json
 import logging
 import os
@@ -23,6 +24,8 @@ import torch
 import torch.distributed
 from accelerate import init_empty_weights
 from omegaconf import DictConfig
+from peft.utils import SAFETENSORS_WEIGHTS_NAME
+from safetensors.torch import save_file as safe_save_file
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import ShardedOptimStateDictConfig, ShardedStateDictConfig, StateDictType
 from transformers import GenerationConfig, PreTrainedTokenizer, ProcessorMixin
@@ -134,6 +137,46 @@ class FSDPCheckpointManager(BaseCheckpointManager):
             log_only_rank_0=True,
         )
         return lora_meta_path
+
+    @staticmethod
+    def _save_collected_peft_adapter(hf_local_path: str, unwrap_model, state_dict: dict[str, torch.Tensor]) -> None:
+        """保存已经由 FSDP 聚合并转换成 PEFT 部署键的 adapter。
+
+        ``collect_lora_params`` 内部已经调用 ``get_peft_model_state_dict``，所以返回键已经去掉
+        ``.default`` adapter 名，例如 ``lora_A.weight`` 和 ``score.weight``。如果再把这份字典传给
+        ``PeftModel.save_pretrained(state_dict=...)``，PEFT 会执行第二次过滤：普通 LoRA 键会因为缺少
+        ``.default`` 被全部丢弃，而 ``modules_to_save`` critic 头会寻找已经不存在的内部 wrapper 键。
+
+        因此这里不再二次解释字典，只完成 PEFT ``save_pretrained`` 最终本来要做的两件事：
+        1. 把非连续 tensor 整理为连续 CPU tensor，然后写出标准 ``adapter_model.safetensors``；
+        2. 深拷贝当前 adapter config，以 inference 模式写出 ``adapter_config.json``，不修改训练中
+           的原始 config。保存空 adapter 必须立即报错，不能留下合法文件名但没有参数的 40-byte 文件。
+        """
+
+        if not state_dict:
+            raise ValueError("FSDP collected an empty PEFT adapter state dict; refusing to save an empty checkpoint")
+
+        os.makedirs(hf_local_path, exist_ok=True)
+        cpu_state_dict = {
+            name: tensor.detach().cpu().contiguous()
+            for name, tensor in state_dict.items()
+        }
+        safe_save_file(
+            cpu_state_dict,
+            os.path.join(hf_local_path, SAFETENSORS_WEIGHTS_NAME),
+            metadata={"format": "pt"},
+        )
+
+        peft_configs = getattr(unwrap_model, "peft_config", None)
+        if not peft_configs:
+            raise ValueError("PEFT adapter state exists but unwrap_model.peft_config is empty")
+        if isinstance(peft_configs, dict):
+            peft_config = peft_configs.get("default") or next(iter(peft_configs.values()))
+        else:
+            peft_config = peft_configs
+        deploy_config = copy.deepcopy(peft_config)
+        deploy_config.inference_mode = True
+        deploy_config.save_pretrained(hf_local_path)
 
     def load_checkpoint(self, local_path: str, hdfs_path: str = None, del_local_after_load=False):
         """
@@ -346,7 +389,8 @@ class FSDPCheckpointManager(BaseCheckpointManager):
 
                 if self.rank == 0:
                     os.makedirs(hf_local_path, exist_ok=True)
-                    unwrap_model.save_pretrained(hf_local_path, state_dict=state_dict, safe_serialization=True)
+                    # state_dict 已经是 PEFT 部署键；直接写 safetensors，不能再交给 PEFT 二次过滤。
+                    self._save_collected_peft_adapter(hf_local_path, unwrap_model, state_dict)
                     log_with_rank(
                         f"Saved LoRA adapter hf_model to {os.path.abspath(hf_local_path)}",
                         rank=self.rank,
