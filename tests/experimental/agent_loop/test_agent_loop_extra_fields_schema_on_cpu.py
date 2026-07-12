@@ -22,7 +22,9 @@ import pytest
 import torch
 from omegaconf import OmegaConf
 
+from verl import DataProto
 from verl.experimental.agent_loop.agent_loop import (
+    AgentLoopManager,
     AgentLoopMetrics,
     AgentLoopOutput,
     AgentLoopWorker,
@@ -254,6 +256,37 @@ async def test_agent_loop_extra_fields_schema_stable_for_training_concat_on_cpu(
     # And the list-typed fields are actually lists (not missing / scalar).
     assert merged.non_tensor_batch["turn_scores"][0] == []
     assert merged.non_tensor_batch["tool_rewards"][0] == []
+
+
+def test_manager_aligns_optional_non_tensor_fields_before_worker_concat():
+    """一个 worker 独有的审计列也必须覆盖合并后的全部 action rows。"""
+
+    # 第一个 worker 返回两条正常动作，并且 terminal 分支带有可见 Cache 文本。
+    normal_output = DataProto(
+        batch=None,
+        non_tensor_batch={
+            "memory_action": np.array(["query", "answer"], dtype=object),
+            "memory_visible_cache_text": np.array([None, "[1] Alice lives in Paris."], dtype=object),
+        },
+    )
+    # 第二个 worker 只返回一条失败惩罚动作；这个分支没有 terminal Cache 审计字段。
+    failure_output = DataProto(
+        batch=None,
+        non_tensor_batch={
+            "memory_action": np.array(["update"], dtype=object),
+        },
+    )
+
+    AgentLoopManager._align_worker_non_tensor_schemas([normal_output, failure_output])
+    merged = DataProto.concat([normal_output, failure_output])
+
+    # 缺失值只补成 None，不伪造失败动作的 Cache；关键契约是列长必须等于三条动作行。
+    assert len(merged) == 3
+    assert merged.non_tensor_batch["memory_visible_cache_text"].tolist() == [
+        None,
+        "[1] Alice lives in Paris.",
+        None,
+    ]
 
 
 @pytest.mark.asyncio

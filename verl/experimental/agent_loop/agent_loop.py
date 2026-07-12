@@ -1263,6 +1263,36 @@ class AgentLoopManager:
                 )
             )
 
+    @staticmethod
+    def _align_worker_non_tensor_schemas(outputs: list[DataProto]) -> None:
+        """在跨 worker 拼接前，把所有非张量列补成相同 schema。
+
+        一个 source trajectory 可以展开成多条 action row，不同 source 又可能走不同分支。
+        例如，正常 terminal row 会携带 ``memory_visible_cache_text``，而直接进入失败惩罚的
+        source 没有该字段。每个 ``AgentLoopWorker`` 只能看到自己负责的 source，因此 worker
+        内部的 ``_postprocess`` 无法知道其他 worker 还会返回哪些动态字段。
+
+        ``DataProto.concat`` 要求参与拼接的每个输入都具有相同的列；如果某个 worker 缺列，
+        numpy 只会拼接实际存在的数组，最终就会出现“字段长度小于 batch size”的一致性错误。
+        这里先收集本轮所有非空 worker 输出的字段并集，再为缺失列逐行填入 ``None``。填充值
+        只表达“该 action 没有这个可选审计字段”，不会制造 reward、动作或训练 token。
+
+        该函数原地修改即将被合并的临时输出，避免再复制体积较大的 rollout tensor。
+        """
+
+        if not outputs:
+            return
+
+        all_keys = {key for output in outputs for key in output.non_tensor_batch}
+        for output in outputs:
+            missing_keys = all_keys.difference(output.non_tensor_batch)
+            for key in missing_keys:
+                # 必须显式创建长度等于 action row 数的 object 数组；单个 ``None`` 标量
+                # 无法满足 DataProto 的 batch 维一致性检查，也不能被 np.concatenate 拼接。
+                missing_values = np.empty(len(output), dtype=object)
+                missing_values.fill(None)
+                output.non_tensor_batch[key] = missing_values
+
     @auto_await
     @SkipManager.annotate(role="rollout")
     async def generate_sequences(self, prompts: DataProto) -> DataProto:
@@ -1294,6 +1324,9 @@ class AgentLoopManager:
         skipped_rollouts = sum(int(output.meta_info.pop("skipped_rollouts", 0)) for output in outputs)
         non_empty_outputs = [output for output in outputs if len(output) > 0]
         if non_empty_outputs:
+            # 多动作 Memory-OPD 会让不同 worker 返回不同的可选审计列；必须先统一 schema，
+            # 再交给通用 DataProto.concat。否则列长度可能只覆盖部分 worker 的 action rows。
+            self._align_worker_non_tensor_schemas(non_empty_outputs)
             output = DataProto.concat(non_empty_outputs)
         else:
             output = DataProto(
