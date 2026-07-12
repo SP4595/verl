@@ -45,7 +45,7 @@ from verl.single_controller.ray import (
     ResourcePoolManager,
     create_colocated_worker_cls,
 )
-from verl.trainer.distillation import is_distillation_enabled
+from verl.trainer.distillation import is_distillation_actor_loss_enabled, is_distillation_enabled
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.core_algos import agg_loss
 from verl.trainer.ppo.metric_utils import (
@@ -1326,7 +1326,7 @@ class PPOTrainer(ABC):
         )
         distillation_use_topk = (
             self.distillation_config.distillation_loss.loss_settings.use_topk
-            if is_distillation_enabled(self.config.get("distillation"))
+            if is_distillation_actor_loss_enabled(self.distillation_config)
             else False
         )
         extra_info = {

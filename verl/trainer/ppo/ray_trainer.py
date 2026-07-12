@@ -38,7 +38,7 @@ from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup, ResourcePoolManager
 from verl.single_controller.ray.base import create_colocated_worker_cls
 from verl.trainer.config import AlgoConfig
-from verl.trainer.distillation.losses import is_distillation_enabled
+from verl.trainer.distillation.losses import is_distillation_actor_loss_enabled
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
 from verl.trainer.ppo.metric_utils import (
@@ -1301,7 +1301,7 @@ class RayPPOTrainer:
         )
         distillation_use_topk = (
             self.distillation_config.distillation_loss.loss_settings.use_topk
-            if is_distillation_enabled(self.config.get("distillation"))
+            if is_distillation_actor_loss_enabled(self.distillation_config)
             else False
         )
         ppo_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size

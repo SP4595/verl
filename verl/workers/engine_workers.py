@@ -30,7 +30,11 @@ from torch.distributed.device_mesh import init_device_mesh
 from verl.checkpoint_engine import CheckpointEngineRegistry
 from verl.single_controller.base import Worker
 from verl.single_controller.base.decorator import Dispatch, make_nd_compute_dataproto_dispatch_fn, register
-from verl.trainer.distillation import distillation_ppo_loss, is_distillation_enabled
+from verl.trainer.distillation import (
+    distillation_ppo_loss,
+    is_distillation_actor_loss_enabled,
+    is_distillation_enabled,
+)
 from verl.utils import tensordict_utils as tu
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.device import get_device_name, get_torch_device, set_expandable_segments
@@ -576,7 +580,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             else:
                 assert self.config.rollout.log_prob_micro_batch_size_per_gpu is not None
                 assert self.config.actor.ppo_micro_batch_size_per_gpu is not None
-            if self.distillation_enabled:
+            if is_distillation_actor_loss_enabled(distillation_config):
                 self.loss_fn = partial(
                     distillation_ppo_loss, config=actor_config, distillation_config=distillation_config
                 )

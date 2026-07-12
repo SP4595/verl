@@ -43,6 +43,22 @@ def is_distillation_enabled(config: Optional[DistillationConfig]) -> bool:
     return config.enabled
 
 
+def is_distillation_actor_loss_enabled(config: Optional[DistillationConfig]) -> bool:
+    """Whether the actor objective actually contains a distillation term.
+
+    A teacher server may still be enabled for uses outside the actor objective (for
+    example, a teacher-forced reward/potential scorer).  When task rewards are on
+    and the distillation coefficient is exactly zero, selecting
+    ``distillation_ppo_loss`` would only compute a teacher loss and multiply it by
+    zero.  In that case the actor should use the ordinary PPO loss directly.
+    """
+
+    if not is_distillation_enabled(config):
+        return False
+    loss_config = config.distillation_loss
+    return not (loss_config.use_task_rewards and float(loss_config.distillation_loss_coef) == 0.0)
+
+
 @dataclass
 class DistillationLossSettings(BaseConfig):
     """
