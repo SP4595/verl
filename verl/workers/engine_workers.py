@@ -84,6 +84,22 @@ class TrainingWorker(Worker, DistProfilerExtension):
     and do not provide exact APIs as Tinker does. But this can be added in the future.
     """
 
+    # NOTE：这是 VeRL 训练侧真正干活的底座类 —— actor / ref / critic 的「训练后端」都是它。
+    #   上层的 ActorRolloutRefWorker 只是把它当成 self.actor / self.ref 组合起来对外暴露 RPC，
+    #   真正的前反向、mini-batch 循环、优化器 step、logprob 推理、checkpoint 全在这里。
+    #
+    #   三个能力入口(都由 single_controller 的 @register 暴露成 worker RPC)：
+    #   - train_mini_batch：训练主循环。把一个大 batch 按 mini_batch_size 切开、跑多个 epoch，
+    #     逐个交给 train_batch；这是 update_actor 落到的地方，全 VeRL 的参数更新都从这里发生。
+    #   - train_batch：单个 mini-batch 的前向+反向+optimizer step，核心是
+    #     `self.engine.train_batch(data, loss_function=self.loss_fn)`。loss_fn 由上层按 config
+    #     预先 set 进来(蒸馏则是 distillation_ppo_loss，普通 RL 则是 ppo_loss)。
+    #   - infer_batch：只前向不反向(可选带 loss)，compute_log_prob / compute_ref_log_prob 走它。
+    #
+    #   关键设计：TrainingWorker 自己不认识「PPO / OPD / SFT」，它只认一个注入进来的 self.loss_fn。
+    #   算法差异全部收敛在 loss_fn 里，这个类只负责「把数据喂进 engine、按 loss 反传、聚合指标」。
+    #   engine(FSDP/Megatron/veomni 等)是更底层的并行执行后端，由 EngineRegistry 按 strategy 选。
+
     def __init__(self, config: TrainingWorkerConfig):
         Worker.__init__(self)
 
@@ -244,6 +260,8 @@ class TrainingWorker(Worker, DistProfilerExtension):
         Returns:
 
         """
+        
+        # NOTE： 这是整个 VeRL 最核心的 Actor 优化模块
         maybe_fix_3d_position_ids(data)
         batch_size_per_dp = data.shape[0]
         disable_auto_offload = tu.pop(data, key="disable_auto_offload", default=False)
@@ -441,23 +459,61 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
     NOTE: ActorRolloutRefWorker no longer support spmd mode and run native server mode.
     """
+    
+    # NOTE： 这个worker可能是整个 Verl 包最重要的 worker 没有之一！
+    #
+    #   **在整个模型中， actor / critic / ref 都是一个 train worker, 本质上是 torch，用于更新和 tensor 相关计算**
+    #   **rollout 是一个 BaseRollout，负责处理rollout事宜（比如 VLLM）**
+    #
+    #   它是一个「组合壳」：把 actor / rollout / (可选)ref 三个角色塞进同一批 GPU worker。
+    #   - self.actor  = TrainingWorker  （训练底座，policy/蒸馏 loss）
+    #   - self.ref    = TrainingWorker  （可选；ref_in_actor 时甚至复用 actor 那份模型）
+    #   - self.rollout = vLLM 生成引擎
+    #   对外暴露的 update_actor / compute_log_prob 只是语义包装，内部转调 self.actor 的
+    #   train_mini_batch / infer_batch。
+    #
+    #   为什么这三个要绑在一起(而 critic 不绑)：
+    #   - actor 和 rollout 共享同一份 policy 权重，绑一起才能每步原地(naive in-process)把新权重
+    #     灌进同批 worker 的 vLLM，省掉跨进程传大张量；
+    #   - hybrid engine 时分复用同一批卡的显存(训练用 FSDP / 生成用 vLLM，靠 sleep/wake 轮流)，
+    #     这套内存腾挪必须在同一个 worker 内本地完成；
+    #   - ref 常是 actor 的冻结副本，顺手一起放。
+    #
+    #   critic 则不套这个壳：它是另一个模型(value head)，不共享 policy 权重、无生成阶段，
+    #   所以 Role.Critic 直接就是裸的 TrainingWorker —— 底座=前端=它自己。trainer 直接调它的
+    #   infer_batch(算 value) / train_mini_batch(更新)，loss_fn 用 set_loss_fn 注入 value loss。
+    #   一句话：TrainingWorker 是通用训练底座，actor 因为要带 rollout+ref 才套壳，critic 光用底座。
 
     def __init__(
         self, config: DictConfig, role: str, distillation_config: Optional[DistillationConfig] = None, **kwargs
     ):
+        
+        # NOTE： init 其实就是初始化一下config和各个成员变量，实际的初始化在 init_model
         Worker.__init__(self)
         self.config = config
         self.distillation_config = distillation_config
         self.distillation_enabled = is_distillation_enabled(distillation_config)
         self.role = role
-        self.actor: TrainingWorker = None
-        self.ref: TrainingWorker = None
-        self.rollout: BaseRollout = None
+        
+        # NOTE： 这些东西要在 init_model 里才实例化，__init__ 只先占位 None。两个原因：
+        # 1. 时机：__init__ 是 Ray 建对象那一刻各 worker 各自跑的，此时整个 WorkerGroup 还没拼齐、
+        #    分布式进程组/rank/rendezvous 还没就绪，而建模型要做 NCCL collective，放这儿会炸；
+        # 2. 编排：建模型/rollout 很重(几十 GB 权重 + 显存腾挪 + actor→rollout 顺序),要由 controller
+        #    事后用 @register(ONE_TO_ALL) 的 init_model 统一广播、可控触发。
+        self.actor: TrainingWorker = None # 这个就是我们的policy
+        self.ref: TrainingWorker = None # 这个就是我们的 reference model
+        self.rollout: BaseRollout = None # 这个是我们的 vllm 推理后端（至少现在是）
         assert self.role in ["actor", "rollout", "ref", "actor_rollout", "actor_rollout_ref"]
+        
+        # 当然，这个类也可以只初始化部分信息，这里来选择要不要全部初始化
         self._is_actor = self.role in ["actor", "actor_rollout", "actor_rollout_ref"]
         self._is_rollout = self.role in ["rollout", "actor_rollout", "actor_rollout_ref"]
         self._is_ref = self.role in ["ref", "actor_rollout_ref"]
 
+        # NOTE：这里是「三选一」给整个 worker 挑唯一一份 profiler 配置，所以用 elif 按优先级
+        #   actor > rollout > ref 短路取第一个命中的，不是并列生效。
+        #   对 actor_rollout_ref 来说三个 _is_* 同时为 True，但结果只赋给同一个变量、worker 也只挂
+        #   一个 DistProfiler，故直接采用 actor 的配置(colocation 下 rollout 本就跟随 actor)。
         if self._is_actor:
             omega_profiler_config = config.actor.get("profiler", {})
         elif self._is_rollout:
@@ -467,6 +523,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         else:
             omega_profiler_config = config.ref.get("profiler", {})
 
+        # 变成 dataclass 封装一下
         profiler_config = omega_conf_to_dataclass(omega_profiler_config, dataclass_type=ProfilerConfig)
         if omega_profiler_config.get("tool", None) in ["npu", "nsys", "torch", "torch_memory", "precision_debugger"]:
             tool_config = omega_conf_to_dataclass(
@@ -486,7 +543,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         else:
             rr_mode = "disabled"
         self.enable_routing_replay = rr_mode != "disabled"
-
+        
+        # NOTE： 这些全是config选择，可以忽略。
         DistProfilerExtension.__init__(
             self, DistProfiler(rank=self.rank, config=profiler_config, tool_config=tool_config)
         )
@@ -502,10 +560,15 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def init_model(self):
+        
+        # NOTE： 这是初始化的主函数
+        
         model_config: HFModelConfig = omega_conf_to_dataclass(self.config.model)
 
         # 1. build reference model
         if "ref" in self.role:
+            
+            # step 1： 构建 config #
             # TODO: align ref config with actor config
             with open_dict(self.config.ref):
                 self.config.ref.ppo_mini_batch_size = self.config.actor.ppo_mini_batch_size
@@ -537,13 +600,18 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 self.config.ref.ppo_micro_batch_size_per_gpu
             )
             ref_training_config.engine_config.use_remove_padding = model_config.get("use_remove_padding", False)
-
+            
+            # step 2： 使用 config 初始化 worker #
             self.ref = TrainingWorker(config=ref_training_config)
-            self.ref.reset()
+            self.ref.reset() # 初始化
+            # NOTE： 把内层 ref worker 的分发/收集布局(dp_rank/is_collect)以 "ref" 为名登记到外层 worker，
+            #   让 controller 调 compute_ref_log_prob(@register mesh_name="ref") 时能自动 scatter/gather。
             self.set_dispatch_collect(mesh_name="ref", **self.ref.get_dispatch_collect())
 
         # 2. build actor model
         if "actor" in self.role:
+            
+            # step 1： 构建 config #
             actor_config: ActorConfig = omega_conf_to_dataclass(self.config.actor)
             actor_config.model_config = model_config
             distillation_config: Optional[DistillationConfig] = (
@@ -586,9 +654,18 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 )
             else:
                 self.loss_fn = partial(ppo_loss, config=actor_config)
+                
+                
+            # step 2： 使用 config 初始化 worker #
             self.actor = TrainingWorker(config=actor_training_config)
             self.actor.reset()
-            self.actor.set_loss_fn(self.loss_fn)
+            # NOTE： loss_fn 决定「蒸馏(OPD) vs 策略梯度(PPO/GRPO)」这条线：
+            #   蒸馏→distillation_ppo_loss，普通 RL→ppo_loss。
+            #   但 PPO 和 GRPO 用的是同一个 ppo_loss，二者区别在 advantage estimator(gae vs grpo)
+            #   和有无 critic，那发生在 trainer 编排层，不在这里。
+            self.actor.set_loss_fn(self.loss_fn) # NOTE： 注意，只 loss fn 直接决定了 actor 的优化算法是什么！！！
+            # NOTE： 同理，把内层 actor worker 的分发/收集布局以 "actor" 为名登记到外层 worker，
+            #   让 controller 调 compute_log_prob / update_actor(@register mesh_name="actor") 时能自动 scatter/gather。
             self.set_dispatch_collect(mesh_name="actor", **self.actor.get_dispatch_collect())
 
         # 3. build rollout engine
