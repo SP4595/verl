@@ -671,6 +671,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # 3. build rollout engine
         if "rollout" in self.role:
             rollout_config: RolloutConfig = omega_conf_to_dataclass(self.config.rollout)
+            
+            
+            # NOTE：初始化 rollout worker。基本上只在 AgenticRolloutWorker中使用。一旦进入优化阶段我们一般不会用这玩意
 
             # TODO: move rollout_device_mesh into ServerAdapter
             # 3.1 build rollout device mesh (sglang need only)
@@ -697,6 +700,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             self.peft_merge: bool = model_config.lora.get("merge", False)
 
         # 4. build checkpoint engine
+        
+        # NOTE： 构建 checkpoint engine用于保存。这个部分无需细致了解
         if "actor" in self.role:
             checkpoint_engine_config = omega_conf_to_dataclass(self.config.rollout.checkpoint_engine)
             backend = checkpoint_engine_config.backend
@@ -716,6 +721,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @DistProfiler.annotate(color="olive", role="ref_compute_log_prob")
     @_with_routing_replay_flag(enabled=False)
     def compute_ref_log_prob(self, data: TensorDict) -> TensorDict:
+        
+        
+        
         output = self.ref.infer_batch(data=data)
         return output.cpu() if output is not None else None
 
@@ -723,6 +731,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @DistProfiler.annotate(color="blue", role="actor_compute_log_prob")
     @_with_routing_replay_flag(enabled=True)
     def compute_log_prob(self, data: TensorDict) -> TensorDict:
+        
+        # NOTE： infer_batch 就是执行一次前向传播。如果data中传入了 compute_loss = True (这是默认行为，可以不传)
+        # 那么同时会返回 loss（和Transformers一样）
+        
         output = self.actor.infer_batch(data)
 
         return output.cpu() if output is not None else None
@@ -731,6 +743,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @DistProfiler.annotate(color="red", role="actor_update")
     @_with_routing_replay_flag(enabled=True)
     def update_actor(self, data: TensorDict) -> TensorDict:
+        
+        # NOTE： 核心就是 train mini_batch, 执行一次前向传播，一次反向传播，然后更新
+        
         output = self.actor.train_mini_batch(data=data)
         return output.cpu() if output is not None else None
 
@@ -770,6 +785,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                   transfer via checkpoint engine, suitable for disaggregated
                   trainer/rollout deployments.
         """
+        
+        
+        # NOTE： 这个API的核心就是同步 rollout 和 actor 的权重
 
         # Resolve mode: "auto" falls back to config, explicit values take precedence
         effective_mode = mode if mode != "auto" else self.config.rollout.checkpoint_engine.backend
