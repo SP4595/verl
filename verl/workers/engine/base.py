@@ -26,6 +26,11 @@ from tensordict import TensorDict
 from verl.utils.device import get_device_name, get_vendor
 from verl.utils.tensordict_utils import maybe_fix_3d_position_ids
 
+import logging
+
+logger = logging.getLogger(__file__)
+logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
 
 class BaseEngine:
     """
@@ -108,6 +113,58 @@ class BaseEngine:
         Returns:
             Any: The output of the forward pass, which can be used for loss computation or other purposes.
         """
+        # ================================ NOTE：这是整条训练的「核心黑盒」 ================================
+        # 抽象桩，真正实现在具体引擎子类里（我们跑的是 fsdp/transformer_impl.py 的 FSDPEngine.forward_backward_batch
+        #   + FSDPEngineWithLMHead.forward_step）。下面把「输入 / 输出契约」讲清楚，方便写自定义 loss 时知道该传什么。
+        #
+        # 【一句话】SFT、PPO、OPD(蒸馏)、DPO 的「前向 + 反向」流程完全一样：
+        #   micro-batch 切分 → 模型前向得到 model_output → 调 loss_function(model_output, data) 得标量 loss →
+        #   forward_only=False 时 loss.backward()。换算法只是换 loss_function，引擎这层不用动。
+        #
+        # 【loss_function 的 API】——所有算法都遵守这一个签名：
+        #   loss_function(model_output: dict, data: TensorDict, dp_group) -> (loss: Tensor[标量], metrics: dict)
+        #   注意它只有两个数据入参：model_output 和 data。这两者的分工，恰好就是「梯度」的分界线：
+        #
+        # 【model_output = 唯一的梯度通道】
+        #     反向传播 loss.backward() 只能穿过「带 grad_fn 的可导张量」回到模型参数。而：
+        #       · model_output 是 self.module(...) 前向刚产出的张量，带 grad_fn ——loss 对它求导，梯度就回到模型参数；
+        #       · data 里的一切都是常量：input_ids/mask 不可导；old_log_probs/advantages/ref_log_prob 是上层提前算好、
+        #         detach 过的系数。loss 里它们只当权重/掩码/目标，不回传梯度。
+        #     所以自定义 loss 的本质就是 loss = f( model_output[可导] , data[常量] )：
+        #     想让某个量参与梯度，它必须来自 model_output（模型前向的产物）；只当条件/系数的量，放 data 就行。
+        #
+        #   model_output 的字段（forward_step→prepare_model_outputs 从 logits 组装，都带 grad_fn）：
+        #     - "log_probs" ：必有，response token 的 log 概率——绝大多数 loss 的求导对象（PPO/SFT/OPD/DPO 都用它）；
+        #     - "entropy"   ：可选（熵正则时才有）；   "values"：critic/value 模型才有。
+        #   返回：
+        #     - loss    ：单个标量 tensor（可导），直接拿去 backward（一般已按全局 token 归一化，见 /batch_num_tokens*dp_size）；
+        #     - metrics ：dict，值可为 Metric(带 SUM/MEAN 聚合语义) 或原始标量，用于日志聚合（pg_loss、kl_loss、grad_norm 等）。
+        #
+        # 【引擎硬依赖的 data 输入。不是直接用于回传梯度的部分，但是需要用于计算 loss专门用于定制优化算法】
+        #   data 里绝大多数 key 引擎不看（留给 loss 自取），但这几个是引擎前向/归一化自己要用的，务必保证有：
+        #     - input_ids / attention_mask / position_ids —— forward_step 里 prepare_model_inputs 组装后喂给 self.module 前向；
+        #     - loss_mask —— 引擎入口用它算 batch_num_tokens = all_reduce(SUM, loss_mask.sum())，作全局 token 归一化分母。
+        #   引擎还会自动往 data 塞回：batch_num_tokens、dp_size、sp_size，供 loss 做全局归一化。
+        #
+        # 【其余 data 随意——整个 data 原样传给 loss，loss 自己用 data["xxx"] 挑】
+        #   除上面引擎必需项外，其它 key 引擎一概不看，只是原样切进 micro-batch、原样交给 loss_function。
+        #   要什么额外常量输入，上层构 batch 时塞进 data 即可，引擎不用改：
+        #     - 逐样本/逐 token 张量（随 batch 切）——放 data 的 tensor 字段：PPO 的 old_log_probs/advantages、
+        #       OPD 的老师端 teacher_logprob/topk、DPO 的 ref_log_prob/is_chosen，都走这条路，没有特殊通道；
+        #     - 全局标量/超参（不随样本变）——挂 config 上（partial(loss_fn, config=...) 读 config.beta），
+        #       或 tu.assign_non_tensor(data, k=v) 再 tu.get_non_tensor_data 取。
+        #   （DPO 额外注意：chosen/rejected 别被 micro-batch 切散；ref_log_prob 提前跑一趟 infer_batch 算好再塞 data。）
+        #
+        # 【loss_function 返回】(model_output, data) 进去，吐出两样：
+        #     - loss    ：单个标量 tensor（可导），引擎直接 loss.backward()（一般已按全局 token 归一化，见 /batch_num_tokens*dp_size）；
+        #     - metrics ：dict，值可为 Metric(带 SUM/MEAN 聚合语义) 或原始标量，用于日志聚合（pg_loss、kl_loss 等）。
+        #
+        # 【本函数返回】把 loss_function 的产物 postprocess 成 list[TensorDict]/dict，含三部分：
+        #     - "model_output" ：模型前向产物（log_probs 等），infer_batch(如 compute_log_prob) 用它；
+        #     - "loss"         ：标量 float（已 detach，仅供记录，不再回传）；
+        #     - "metrics"      ：dict，各项训练/评估指标，train_batch 主要用它（含 grad_norm 等）。
+        #   一句话：train_batch 只用 loss/metrics；infer_batch 用 model_output。
+        # =============================================================================================
         raise NotImplementedError
 
     def train_batch(self, data: TensorDict, loss_function: Callable) -> Any:
@@ -123,12 +180,23 @@ class BaseEngine:
         """
         maybe_fix_3d_position_ids(data)
 
+        # NOTE：train = zero_grad → forward_backward_batch(forward_only=False，含 loss.backward()) → optimizer_step。
+        #   跟 SFT 训练步骤完全一致，区别只在 loss_function 是谁。这里 log 一下这一步的输入/输出契约，方便调试自定义 loss。
+        logger.debug(
+            "[engine.train_batch] loss_fn=%s | input data keys=%s | loss_fn 需要的典型条目：log_probs(来自前向)、"
+            "loss_mask / response_mask / old_log_probs / advantages（视算法而定）、dp_size / batch_num_tokens（归一化）",
+            getattr(loss_function, "func", loss_function).__name__ if loss_function is not None else None,
+            list(data.keys()),
+        )
+
         self.optimizer_zero_grad()
         outputs = self.forward_backward_batch(data, loss_function, forward_only=False)
         grad_norm = self.optimizer_step()
         if self.is_mp_src_rank_with_outputs():
             assert "grad_norm" not in outputs["metrics"]
             outputs["metrics"]["grad_norm"] = grad_norm
+            # NOTE：输出契约——outputs 含 "loss"(标量)、"metrics"(dict，此处补进 grad_norm)，训练只用这两样。
+            logger.debug("[engine.train_batch] output metrics keys=%s", list(outputs["metrics"].keys()))
         return outputs
 
     def infer_batch(self, data: TensorDict, loss_function: Optional[Callable] = None) -> Any:
@@ -144,6 +212,8 @@ class BaseEngine:
         # see comments from train_batch
         maybe_fix_3d_position_ids(data)
 
+        # NOTE：infer = 和 train 落到同一个 forward_backward_batch，只是 forward_only=True 且包在 no_grad 里：
+        #   只前向、不反向、不更新。loss_function 可为 None（如只算 log_probs/values）；SFT/eval 需要顺带算 loss 时才传。
         with torch.no_grad():
             outputs = self.forward_backward_batch(data, loss_function, forward_only=True)
         return outputs

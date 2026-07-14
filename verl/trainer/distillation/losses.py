@@ -216,6 +216,27 @@ def distillation_ppo_loss(
     - student_logits is None, return the final policy loss scalar and metrics.
     """
 
+    # ===================== NOTE：怎么区分「传统 OPD」和「PG-OPD」？=====================
+    # 三个开关都在 distillation_config.distillation_loss 下，组合出不同路线：
+    #
+    #   (1) use_policy_gradient —— 这是「传统 OPD vs PG-OPD」的【核心分水岭】，判定在下面的 distillation_loss() 里：
+    #         · False → 传统 OPD（监督式 GKD）：distillation_losses 直接 agg_loss 当监督 loss 回传（arxiv 2306.13649）。
+    #                   走这条时 loss_mode=forward_kl_topk（top-k 前向 KL），只需老师端 teacher_logprobs/teacher_ids，
+    #                   不需要 old_log_probs/advantages。
+    #         · True  → PG-OPD（on-policy 蒸馏）：把 -distillation_losses.detach() 当 advantage/reward，
+    #                   丢进 policy_loss_fn 走策略梯度（thinkingmachines on-policy-distillation）。
+    #                   走这条时 loss_mode=k1，需要 old_log_probs、response_mask、可选 rollout_is_weights（IS 校正）。
+    #
+    #   (2) use_task_rewards —— 正交开关，决定要不要在蒸馏目标之外再叠一个「真实任务」的 PPO 目标（就在本函数下面）：
+    #         · False → 纯蒸馏：policy_loss = distill_loss（Memory-OPD 就是这条，见 trainer 的校验）；
+    #         · True  → 混合：policy_loss = ppo_loss(...) + distill_loss * distillation_loss_coef。
+    #
+    #   (3) loss_mode —— 选具体蒸馏 loss 实现（forward_kl_topk / k1 ...），与 (1) 配套（见 get_distillation_loss_fn）。
+    #
+    #   小结：本函数负责「蒸馏 vs 蒸馏+任务奖励」(use_task_rewards)；
+    #         「监督式 vs 策略梯度」(use_policy_gradient) 的真正分叉在 distillation_loss() 内部。
+    # ================================================================================
+
     # Called as logits processor
     if student_logits is not None:
         return compute_topk_loss(config, distillation_config, data, student_logits, data_format)

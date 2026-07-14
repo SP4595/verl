@@ -103,7 +103,7 @@ class TrainingWorker(Worker, DistProfilerExtension):
     def __init__(self, config: TrainingWorkerConfig):
         Worker.__init__(self)
 
-        from verl.workers.engine import BaseEngine, EngineRegistry
+        from verl.workers.engine import EngineRegistry, BaseEngine
 
         initialize_global_process_group_ray(timeout_second=None)
 
@@ -144,6 +144,8 @@ class TrainingWorker(Worker, DistProfilerExtension):
         )
 
         self.model_config.model_type = self.config.model_type
+        # NOTE： 运行时 EngineRegistry.new 按 strategy 返回具体引擎实例（我们这条线就是 FSDPEngineWithLMHead）；
+        #   静态类型用基类 BaseEngine。想看真正实现：train_batch/infer_batch 在 base，forward_backward_batch/forward_step 在 fsdp 子类。
         self.engine: BaseEngine = EngineRegistry.new(
             model_type=self.config.model_type,
             backend=self.engine_config.strategy,
@@ -151,7 +153,7 @@ class TrainingWorker(Worker, DistProfilerExtension):
             engine_config=self.engine_config,
             optimizer_config=self.optimizer_config,
             checkpoint_config=self.checkpoint_config,
-        )
+        ) # NOTE：实际上是 "FSDPEngineWithLMHead"
 
         # build dispatch info
         self._register_dispatch_collect_info(
@@ -307,6 +309,12 @@ class TrainingWorker(Worker, DistProfilerExtension):
             for batch_idx, mini_batch_td in enumerate(dataloader):
                 # add global token num
                 # NOTE： 获取整个batch的tokens长度
+                # NOTE： input_ids 不是定长 [B, L] 矩阵，而是 nested/jagged tensor(NJT，紧凑打包、无 padding)。
+                #   只有 NJT 才有 .offsets()——它是各序列在 packed buffer 里的边界，例如 [0,123,211,411]。
+                #   .diff() 相邻边界相减 = 每条序列的真实长度 [123,88,200]，全是有效 token，不含任何 padding。
+                #   所以这行既"统计了长度"(靠边界相减而非 mask.sum)，也天然无 padding。注释里 total_nnz = 有效 token 总数。
+                #   注意：这个 list 只喂 MFU/FLOPs(attention 是二次，需逐序列长度，不能提前求和)；
+                #   loss 归一化的分母 batch_num_tokens 是引擎里用 loss_mask.sum()+all_reduce(SUM) 另算的，与此无关。
                 if "input_ids" in mini_batch_td:
                     global_token_num = mini_batch_td["input_ids"].offsets().diff().tolist()  # (total_nnz,)
                     # allgather from dp rank
@@ -319,13 +327,18 @@ class TrainingWorker(Worker, DistProfilerExtension):
                     global_token_num = [x for xs in global_token_num_output for x in xs]
                 else:
                     global_token_num = None
-
+                    
+                # NOTE： 以上代码仅仅是为了统计。和真实训练没关系
+                
+                # minibatch中插入 NonTensorData
                 tu.assign_non_tensor(
                     mini_batch_td,
                     global_token_num=NonTensorData(global_token_num),
                     update_lr_scheduler=batch_idx == total_num_iterations - 1,
                     disable_auto_offload=True,
                 )
+                
+                # ----- NOTE： 上面铺垫了这么多，其实现在才是真正的训练代码！ ----- #
                 actor_output = self.train_batch(mini_batch_td)
                 output_lst.append(actor_output)
 
@@ -370,11 +383,31 @@ class TrainingWorker(Worker, DistProfilerExtension):
         for key, val in default_keys.items():
             if key not in data.keys():
                 tu.assign_non_tensor(data, **{key: val})
+                
+                
+        # 以上都是从data中获取各种参数
 
         with (
             self.engine.train_mode(disable_auto_offload=disable_auto_offload),
             Timer(name="train_batch", logger=None) as timer,
-        ):
+        ):  
+            # NOTE： 这句代码是核心，调用 engine 的 train_batch。
+            #   ★ 真正干活的其实是 engine 的 forward_backward_batch —— train_batch 和 infer_batch 共用同一个底层函数：
+            #     · engine.train_batch  = optimizer_zero_grad() → forward_backward_batch(forward_only=False) → optimizer_step()
+            #                             （前向 + 反向求梯度 + 梯度下降更新参数）
+            #     · engine.infer_batch  = torch.no_grad() 下 forward_backward_batch(forward_only=True)
+            #                             （只前向，不反向、不更新，可选算 loss）
+            #   所以 train 与 infer 的唯一区别就是：要不要 backward + 优化器 step。
+            #   ★★ 注意 forward_backward_batch 在 base.py 里只是抽象桩（raise NotImplementedError），
+            #      真正实现是三层：
+            #        1) base.py 的 train_batch/infer_batch  —— 编排 zero_grad→forward_backward_batch→step；
+            #        2) fsdp/transformer_impl.py FSDPEngine.forward_backward_batch  —— 切 micro-batch、循环调 forward_step、
+            #           not forward_only 时 loss.backward()；
+            #        3) fsdp/transformer_impl.py FSDPEngineWithLMHead.forward_step  —— 真正跑 self.module(**inputs)，
+            #           再调 loss_function(model_output, data, dp_group)。
+            #   ★★★ OPD 和 PPO 在 forward_backward_batch / forward_step 这层【完全一样、没有任何分支】！
+            #        差异 100% 收敛在注入的 loss_function 上：OPD(蒸馏)→distillation_ppo_loss，普通 RL→ppo_loss。
+            #        引擎侧把 self.loss_fn 当黑盒调用，根本不知道自己在做蒸馏还是 PPO。
             output = self.engine.train_batch(data, loss_function=self.loss_fn)
             # containing loss, model_output and metrics
             # for training, we only care about loss and metrics
@@ -434,6 +467,12 @@ class TrainingWorker(Worker, DistProfilerExtension):
         ):
             adapter_ctx = self.engine.disable_adapter() if no_lora_adapter else nullcontext()
             with adapter_ctx:
+                
+                # NOTE： 这里是核心，调用 engine 的 infer_batch。
+                #   它和 train_batch 落到的是同一个底层函数 forward_backward_batch，只是 forward_only=True、且包在 torch.no_grad() 里：
+                #   只前向、不反向、不更新参数（loss_function 可为 None；SFT/eval 需要则传入以顺带算 loss）。
+                #   forward_backward_batch 的真正实现在 fsdp/transformer_impl.py 的 FSDPEngine（forward_step 又落到
+                #   FSDPEngineWithLMHead），base.py 里只是抽象桩。同 train，OPD/PPO 在这层不分叉，只看注入的 loss_function。
                 output = self.engine.infer_batch(data, loss_function=loss_function)
         delta_time = timer.last
 
@@ -654,14 +693,26 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             else:
                 assert self.config.rollout.log_prob_micro_batch_size_per_gpu is not None
                 assert self.config.actor.ppo_micro_batch_size_per_gpu is not None
+            # ============================ NOTE：OPD / PPO 两个 loss 函数在哪定义？ ============================
+            #   这里是「选哪个 loss」的分叉点：根据 distillation 开关，把对应的 loss 函数用 partial 绑好配置，
+            #   存进 self.loss_fn，之后 set_loss_fn 注入 actor，训练时被 engine 当黑盒回调。
+            #
+            #   · OPD(蒸馏)  loss 对象类型：functools.partial[distillation_ppo_loss]
+            #       定义位置：verl/trainer/distillation/losses.py → distillation_ppo_loss
+            #       （经 verl/trainer/distillation/__init__.py 转出口，本文件顶部 `from verl.trainer.distillation import distillation_ppo_loss` 导入）
+            #   · PPO/GRPO   loss 对象类型：functools.partial[ppo_loss]
+            #       定义位置：verl/workers/utils/losses.py → ppo_loss
+            #       （从本文件顶部 `from verl.workers.utils.losses import ppo_loss` 导入）
+            #
+            #   两者签名一致：loss_fn(model_output, data, dp_group) -> (loss, metrics)，符合 base.py 的 loss 契约。
+            # ============================================================================================
             if is_distillation_actor_loss_enabled(distillation_config):
+                # NOTE： 小技巧：使用 partial传入的function 可以预填充一些paramater。
                 self.loss_fn = partial(
                     distillation_ppo_loss, config=actor_config, distillation_config=distillation_config
                 )
             else:
                 self.loss_fn = partial(ppo_loss, config=actor_config)
-                
-                
             # step 2： 使用 config 初始化 worker #
             self.actor = TrainingWorker(config=actor_training_config)
             self.actor.reset()
