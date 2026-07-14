@@ -284,6 +284,10 @@ def distillation_ppo_loss(
     distillation_loss_config = distillation_config.distillation_loss
     distill_loss, distill_metrics = distillation_loss(config, distillation_config, model_output, data)
     if distillation_loss_config.use_task_rewards:
+        
+        
+        # 当然，PPO loss 就会简单很多很多！！！！！！！
+        
         policy_loss, policy_metrics = ppo_loss(config, model_output, data, dp_group)
         policy_loss += distill_loss * distillation_loss_config.distillation_loss_coef
     else:
