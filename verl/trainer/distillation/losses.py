@@ -150,6 +150,13 @@ def compute_topk_loss(
     - student_mass: (bsz, seqlen/cp_size)
     - teacher_mass: (bsz, seqlen/cp_size)
     """
+
+    # NOTE：这里才是真正算 loss 的地方（被第一次调用 = forward 内部的 logits processor 触发）。
+    # 按 config.strategy 分发到 fsdp/megatron 后端的 compute_forward_kl_topk，拿原始 student_logits
+    # + 老师 top-k 现算。★ 返回的是【每 token 张量的 dict】
+    #   {distillation_losses, student_mass, teacher_mass, overlap_count, overlap_token_advantage}，
+    #   不是标量 loss；这个 dict 会被上层 prepare_model_outputs 逐 key 存进 model_output，留给第二次调用聚合。
+
     match config.strategy:
         # VeOmni uses FSDP2 internally, so its loss computation is identical to FSDP.
         case "fsdp" | "veomni":
@@ -216,6 +223,30 @@ def distillation_ppo_loss(
     - student_logits is None, return the final policy loss scalar and metrics.
     """
 
+    # ===================== NOTE：本函数怎么被调用的？——被塞进 forward，一共调两次 =====================
+    # 这个函数会被绑定成 loss_function 后「塞给 engine 的 forward」（见 engine_workers.py::init_model 里的
+    # functools.partial），而 FSDPEngineWithLMHead.forward_step 会在【同一个前向步】里把它用两次：
+    #
+    #   第一次【在 forward 内部，当 logits processor】（只有 top-k 模式才会发生）：
+    #     forward_step → prepare_model_outputs(..., logits_processor_func=本函数) 里，
+    #     趁原始 logits (bsz, seqlen, vocab) 还活着，调 logits_processor_func(student_logits=logits, data=...)。
+    #     → 命中下面 `student_logits is not None` 分支 → compute_topk_loss → 后端算出【每 token 的 KL 字典】
+    #       {distillation_losses, student_mass, teacher_mass, ...}，return 回 prepare_model_outputs，
+    #       被逐 key 存进 model_output[k]（见 transformer_impl.py `for k, v in outputs.items()`）。
+    #     ★ 注意：这一次 return 的【不是标量 loss】，而是每 token 张量的 dict；它 return 给的是 engine，不是训练循环。
+    #
+    #   第二次【forward 结束后，当最终 loss】：
+    #     forward_step 里 loss_function(model_output=model_output, data=...)（没传 student_logits → 默认 None）。
+    #     → 走下面 else 分支 → distillation_loss(...) 把第一次存进 model_output 的每 token 结果读出来、
+    #       agg_loss 聚合成【标量 loss】return 出去，这个标量才拿去 backward。
+    #
+    # 为什么非得勈成两次：原始 logits 太大且被 TP/SP 分片，不能 gather 出 forward 交给外层 loss；
+    #   只能趁它在 forward 里、还带 grad_fn 时就地压成每 token loss（第一次），
+    #   等 engine 把 model_output 拼好、SP all-gather 完，再聚合成标量（第二次）。
+    #   两次都不多余：第一次产「原料」（每 token KL），第二次做「成品」（标量）。而且 engine 钩子契约也只允许
+    #   第一次返回「形状==log_probs 的每 token 张量」，不许返回标量，所以聚合必须推迟到第二次。
+    # ============================================================================================
+
     # ===================== NOTE：怎么区分「传统 OPD」和「PG-OPD」？=====================
     # 三个开关都在 distillation_config.distillation_loss 下，组合出不同路线：
     #
@@ -237,11 +268,19 @@ def distillation_ppo_loss(
     #         「监督式 vs 策略梯度」(use_policy_gradient) 的真正分叉在 distillation_loss() 内部。
     # ================================================================================
 
-    # Called as logits processor
+    # ---------- 第一次调用：在 forward 内部当 logits processor（仅 top-k 模式才会发生）----------
+    # 进来时 student_logits 非 None（engine 趁 logits 还活着把它传进来）。
+    # 这里只负责：拿原始 logits 现算「每 token 的 top-k KL 字典」，然后 return 回 engine
+    #（prepare_model_outputs 会把它逐 key 存进 model_output，供下面第二次调用聚合用）。
+    # ★ 返回的是「每 token 张量的 dict」，不是标量 loss；接收方是 engine，不是训练循环。
     if student_logits is not None:
         return compute_topk_loss(config, distillation_config, data, student_logits, data_format)
 
-    # Called as final policy loss
+    # ---------- 第二次调用：forward 之后当最终 loss ----------
+    # 进来时 student_logits 为 None：
+    #   · top-k 模式(forward_kl_topk)：model_output 里已经有第一次存好的每 token 结果，distillation_loss 只做「读出+聚合」。
+    #   · estimator 模式(k1/kl/...)：根本没有第一次调用，distillation_loss 直接用 log_probs 现算 KL（见其内部）。
+    # 总之 distillation_loss(...) 产出【标量 distill_loss】，这才是 backward 用的 loss。
     distillation_loss_config = distillation_config.distillation_loss
     distill_loss, distill_metrics = distillation_loss(config, distillation_config, model_output, data)
     if distillation_loss_config.use_task_rewards:
@@ -275,6 +314,16 @@ def distillation_loss(
     """
     assert distillation_config is not None
     loss_config: DistillationLossConfig = distillation_config.distillation_loss
+    # NOTE：distillation_loss_fn 是「按 loss_mode 从注册表动态查出来的函数」，所以点不进去。
+    #   解析链：get_distillation_loss_fn(loss_mode) → DISTILLATION_LOSS_REGISTRY[loss_mode]，
+    #   这张表由 @register_distillation_loss(...) 装饰器在模块导入时填充。loss_mode → 实际源码：
+    #     · "forward_kl_topk"                          → compute_forward_kl_topk（本文件下方）；
+    #           ⚠ 但它只是「读结果」：真正的逐 token top-k KL 早在 logits processor 阶段就算好了
+    #             （compute_topk_loss → 按 strategy 落到 trainer/distillation/{fsdp,megatron}/losses.py 的
+    #              compute_forward_kl_topk），这里只从 model_output["distillation_losses"/"student_mass"/...] 取出来。
+    #     · "kl"/"k1"/"abs"/"mse"/"k2"/"low_var_kl"/"k3" → compute_distillation_loss_reverse_kl_estimator（本文件下方，
+    #           用 core_algos.kl_penalty 的单样本 KL 估计器，直接从 student/teacher log_probs 现算）。
+    #   两个被注册的实现都带 @register_distillation_loss，就在本文件后半段，Ctrl+F 函数名即可跳到。
     distillation_loss_fn = get_distillation_loss_fn(loss_config.loss_mode)
     distillation_losses, distillation_metrics = distillation_loss_fn(
         config=config,
@@ -342,6 +391,43 @@ def compute_forward_kl_topk(
     - distillation_losses: (bsz, resp_len)
     - distillation_metrics: Dictionary of metrics.
     """
+    
+    # NOTE： 这是传统 OPD 的 loss function
+    #
+    # ★★★ 重要（也是一个设计上的坑）★★★
+    # 别被这个函数名骗了：真正的 top-k 蒸馏 loss 并不是在这里算的，而是早在
+    #     FSDPEngineWithLMHead.prepare_model_outputs（见 verl/workers/engine/fsdp/transformer_impl.py，
+    #     那段 `if distillation_use_topk:` → logits_processor_func(student_logits=logits_rmpad, ...)）
+    # 里、前向还没结束时就已经算好、并存进了 model_output["distillation_losses"/"student_mass"/"teacher_mass"]。
+    # 这个函数只是「收尾」：把那批已经算好的每 token 结果读出来、聚合成一个标量。
+    # 所以下面几行 model_output["distillation_losses"] 一进来就是现成的，看着很反直觉。
+    #
+    # 为什么会变成这样（两次调用的真相）：distillation_ppo_loss 其实被调了两次——
+    #   第一次（在 prepare_model_outputs 内部，logits 还活着）：引擎把同一个 loss 函数当作
+    #     “logits processor” 钩子传进去，student_logits is not None → compute_topk_loss，
+    #     就地把 (total_nnz, vocab) 的巨型 logits + 老师 top-k 压成「每 token 的 KL 字典」（不是标量），
+    #     return 回 engine 后被逐 key 存回 model_output，然后巨型 logits 用完即弃。
+    #   第二次（前向结束，当最终 loss）：student_logits=None → distillation_loss → 走到这里做聚合。
+    # 它这么绕的（唯一）理由：logits 形状 (所有 token × 整个词表) 巨大且被 TP/SP 分片，不能 gather 出来
+    #   传给外层 loss；必须趁它还在 forward、还带 grad_fn 时就地压成每 token loss，梯度链才能保持连通
+    #   （参数→logits→distillation_losses→这里聚合→标量 loss→backward）。
+    #
+    # 吐槽：从代码设计角度这确实是灾难——loss 的计算被劈成两半、一半藏在 engine 的 prepare_model_outputs 里，
+    #   违背了「loss 就该在 loss function 里算完」的直觉；靠 student_logits 是否为 None 来复用同一函数做两件事，
+    #   可读性很差。它是为性能/显存做的妥协，不是好范式，读的时候心里有数即可。
+    #
+    # ── 真正干活的 loss function 到底在哪？（完整调用链，方便你去看）──
+    #   engine 前向内部：FSDPEngineWithLMHead.prepare_model_outputs
+    #     （verl/workers/engine/fsdp/transformer_impl.py，`if distillation_use_topk:` 那段）
+    #       └─ 调 logits_processor_func(student_logits=logits_rmpad, ...)  # 即本文件的 distillation_ppo_loss
+    #            └─ distillation_ppo_loss 里 `student_logits is not None` 分支
+    #                 └─ compute_topk_loss(...)              # 本文件，line ~139，按 config.strategy 分发
+    #                      ├─ strategy=="fsdp"/"veomni" → verl/trainer/distillation/fsdp/losses.py::compute_forward_kl_topk  ← ★真正算 KL 的地方
+    #                      └─ strategy=="megatron"       → verl/trainer/distillation/megatron/losses.py::compute_forward_kl_topk
+    #   ★ 那个后端 compute_forward_kl_topk 才是真身：F.log_softmax(student_logits) → 对老师 top-k 位置 gather →
+    #     kl_divergence(log_q=student, log_p=teacher)，产出每 token 的 distillation_losses/student_mass/teacher_mass。
+    #   注意：本文件这个同名的 compute_forward_kl_topk（下面）只是「聚合器」，别和 fsdp/megatron 后端那个真身混了。
+    #
     # topk loss has been computed in logits processor
     distillation_losses = no_padding_2_padding(model_output["distillation_losses"], data)
     student_mass = no_padding_2_padding(model_output["student_mass"], data)

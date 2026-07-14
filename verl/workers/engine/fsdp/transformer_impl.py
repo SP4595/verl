@@ -1183,6 +1183,14 @@ class FSDPEngineWithLMHead(FSDPEngine):
                     sum_pi_squared_rmpad = verl_F.calculate_sum_pi_squared_from_logits(logits_rmpad)
 
                 # logits_processor_func return tensors with shape (1, total_nnz/sp_size)
+                # NOTE：这就是 OPD top-k 蒸馏 loss 的「第一次调用（真正干重活的一次）」。
+                # logits_processor_func 就是外层注入的那个 loss 函数（distillation_ppo_loss），这里把它当
+                # “logits processor” 钩子用：趁 logits_rmpad = (total_nnz, vocab) 这个巨型张量还在 forward 里、
+                # 还带 grad_fn，就地把它 + 老师 top-k 压成「每 token 一个标量」(shape (1, total_nnz))，
+                # 结果 distillation_losses/student_mass/teacher_mass 存进 model_output[k]，然后巨型 logits 用完即弃。
+                # 为什么不在外层 loss 里算？因为 logits 太大且被 TP(词表维)/SP(序列维)分片，gather 出去扛不住显存/通信。
+                # 之后收尾时同一个 loss 函数会被「第二次调用」(student_logits=None)，那次只把这里存好的每 token 结果
+                # 读出来聚合成标量（见 trainer/distillation/losses.py::compute_forward_kl_topk）。
                 if distillation_use_topk:
                     outputs = logits_processor_func(student_logits=logits_rmpad.unsqueeze(0), data=micro_batch)
                     cu_seqlens = input_ids.offsets()
