@@ -262,7 +262,10 @@ class TrainingWorker(Worker, DistProfilerExtension):
         """
         
         # NOTE： 这是整个 VeRL 最核心的 Actor 优化模块
-        maybe_fix_3d_position_ids(data)
+        # NOTE： epochs=复用同一批数据更新几次。PPO 靠 clipped importance ratio(old_log_probs)修正 off-policy，
+        #   所以 epochs 可以 !=1；传统 OPD(forward_kl_topk 在线蒸馏)没有 ratio 修正、要求严格 on-policy，必须 epochs=1。
+        #   (例外：PG 形式的 OPD/k1 带 ratio，可像 PPO 一样 epochs>1。)
+        maybe_fix_3d_position_ids(data) # 解决一些多模态token。不过在我们这里没有多大意义
         batch_size_per_dp = data.shape[0]
         disable_auto_offload = tu.pop(data, key="disable_auto_offload", default=False)
         mini_batch_size = tu.pop(data, key="mini_batch_size", default=None)
@@ -277,12 +280,14 @@ class TrainingWorker(Worker, DistProfilerExtension):
             assert batch_size_per_dp % num_mini_batch == 0, f"Got {batch_size_per_dp=} and {num_mini_batch=}"
             mini_batch_size_per_gpu = batch_size_per_dp // num_mini_batch
         else:
+            # NOTE： mini-batchsize 必须和当前 engine Data Parallel 份数整除
+            # NOTE： 一般我们可能同时会有TP和DP。DP表示一份batch会分成几份，TP 表示多少个GPU装一个模型
             assert mini_batch_size % self.engine.get_data_parallel_size() == 0, (
                 f"Got {mini_batch_size=} and {self.engine.get_data_parallel_size()=}"
             )
             mini_batch_size_per_gpu = mini_batch_size // self.engine.get_data_parallel_size()
 
-        # make iterator
+        # 构建data loader，注意，会被重复 epochs 次哦
         dataloader = tu.make_iterator(
             data,
             mini_batch_size=mini_batch_size_per_gpu,
@@ -301,6 +306,7 @@ class TrainingWorker(Worker, DistProfilerExtension):
 
             for batch_idx, mini_batch_td in enumerate(dataloader):
                 # add global token num
+                # NOTE： 获取整个batch的tokens长度
                 if "input_ids" in mini_batch_td:
                     global_token_num = mini_batch_td["input_ids"].offsets().diff().tolist()  # (total_nnz,)
                     # allgather from dp rank
@@ -799,7 +805,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             return
 
         set_expandable_segments(False)
-        # 长序列反向传播结束后，actor 可能在 PyTorch 缓存分配器中残留数 GiB 显存。
+        # NOTE： 长序列反向传播结束后，actor 可能在 PyTorch 缓存分配器中残留数 GiB 显存。
         # vLLM 的 CuMem 分配器在重新映射休眠权重时需要立即取得物理显存，因此必须在
         # wake_up 之前清理 actor 缓存，不能等到权重传输完成后才清理。
         aggressive_empty_cache(force_sync=True)
