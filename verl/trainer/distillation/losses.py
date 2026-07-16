@@ -252,14 +252,16 @@ def distillation_ppo_loss(
     #
     #   (1) use_policy_gradient —— 这是「传统 OPD vs PG-OPD」的【核心分水岭】，判定在下面的 distillation_loss() 里：
     #         · False → 传统 OPD（监督式 GKD）：distillation_losses 直接 agg_loss 当监督 loss 回传（arxiv 2306.13649）。
-    #                   走这条时 loss_mode=forward_kl_topk（top-k 前向 KL），只需老师端 teacher_logprobs/teacher_ids，
-    #                   不需要 old_log_probs/advantages。
+    #                   走这条时 loss_mode=forward_kl_topk（top-k 前向 KL）；这个 GKD 分支本身只消费
+    #                   teacher_logprobs/teacher_ids，不用 old_log_probs/advantages。但外层 VeRL 原版仍会调用
+    #                   一次随后清零的 ppo_loss scaffold，因此提交给统一入口的 batch 仍要带这两个接口字段。
     #         · True  → PG-OPD（on-policy 蒸馏）：把 -distillation_losses.detach() 当 advantage/reward，
     #                   丢进 policy_loss_fn 走策略梯度（thinkingmachines on-policy-distillation）。
     #                   走这条时 loss_mode=k1，需要 old_log_probs、response_mask、可选 rollout_is_weights（IS 校正）。
     #
     #   (2) use_task_rewards —— 正交开关，决定要不要在蒸馏目标之外再叠一个「真实任务」的 PPO 目标（就在本函数下面）：
-    #         · False → 纯蒸馏：policy_loss = distill_loss（Memory-OPD 就是这条，见 trainer 的校验）；
+    #         · False → 纯蒸馏：仍按原版执行 ppo_loss，但立刻清零其标量，最终 policy_loss = distill_loss
+    #                   （Memory-OPD 就是这条，见 trainer 的校验）；
     #         · True  → 混合：policy_loss = ppo_loss(...) + distill_loss * distillation_loss_coef。
     #
     #   (3) loss_mode —— 选具体蒸馏 loss 实现（forward_kl_topk / k1 ...），与 (1) 配套（见 get_distillation_loss_fn）。
@@ -282,22 +284,45 @@ def distillation_ppo_loss(
     #   · estimator 模式(k1/kl/...)：根本没有第一次调用，distillation_loss 直接用 log_probs 现算 KL（见其内部）。
     # 总之 distillation_loss(...) 产出【标量 distill_loss】，这才是 backward 用的 loss。
     distillation_loss_config = distillation_config.distillation_loss
-    distill_loss, distill_metrics = distillation_loss(config, distillation_config, model_output, data)
-    if distillation_loss_config.use_task_rewards:
-        
-        
-        # 当然，PPO loss 就会简单很多很多！！！！！！！
-        
-        policy_loss, policy_metrics = ppo_loss(config, model_output, data, dp_group)
-        policy_loss += distill_loss * distillation_loss_config.distillation_loss_coef
-    else:
-        # Pure supervised/GKD OPD has no task-policy objective. Do not require
-        # placeholder advantages/old-logprobs or execute a PPO loss that would
-        # be discarded immediately afterwards.
-        policy_loss = distill_loss
-        policy_metrics = {}
 
+    # NOTE（严格保留 VeRL 原版的最终 loss 编排）：下面的先后顺序和职责不能混为一谈。
+    #
+    #   1. ``distillation_loss(...)`` 始终先计算蒸馏项：
+    #      · ``use_policy_gradient=False`` 是传统 GKD-OPD，直接聚合 teacher top-k
+    #        forward KL；
+    #      · ``use_policy_gradient=True`` 是 PG-OPD，把 teacher/student 差异作为
+    #        advantage，走蒸馏配置自己的 policy-gradient loss。
+    #   2. ``ppo_loss(...)`` 随后始终执行。这是 VeRL 为“纯蒸馏”和“蒸馏 + task reward”共用
+    #      一套 actor loss 接口而保留的标准 PPO scaffold。它会读取 response_mask、old_log_probs、
+    #      advantages，并顺带把 data 中的 dp_size、batch_num_tokens、global_batch_size 写入
+    #      ``config.global_batch_info``；这些字段也供后续 micro-batch 的 loss 聚合复用。
+    #   3. ``use_task_rewards=False`` 时，刚算出的标准 PPO 标量会被显式清零，因此它不参与最终
+    #      参数更新；最终只留下 distill_loss。此时 old_log_probs/advantages 仍是调用
+    #      ``ppo_loss`` 的接口契约，并不表示传统 GKD-OPD 算法本身依赖 PPO ratio 或 task reward。
+    #   4. ``use_task_rewards=True`` 时才保留标准 PPO 标量，并按 distillation_loss_coef 叠加
+    #      蒸馏项，形成 PPO/GRPO task objective + OPD 的混合目标。
+    #
+    # NOTE（原版调用顺序的可见副作用）：FSDP 的 forward_backward_batch 会先在完整 optimizer
+    # batch 上计算 data["batch_num_tokens"]，再切 micro-batch；ppo_loss 只是把 data 中已经存在的
+    # dp_size/batch_num_tokens/global_batch_size 复制到 ``config.global_batch_info``。但 VeRL 原版在
+    # 当前调用中先聚合 distill_loss，之后才调用 ppo_loss，所以当前 distill 聚合不会由“下面这次”
+    # ppo_loss 预先初始化；ActorConfig 在调用间复用，刚写入的信息只能供后续调用继续读取。
+    # 本项目严格保留这个顺序，不提前复制、不抽取公共初始化，也不把它包装成自己的聚合修复。
+    distill_loss, distill_metrics = distillation_loss(config, distillation_config, model_output, data)
+    policy_loss, policy_metrics = ppo_loss(config, model_output, data, dp_group)
+    if not distillation_loss_config.use_task_rewards:
+        # NOTE：严格对应 VeRL 原版。这里只清零标准 PPO/task-reward 标量；上面已经得到的
+        # distill_loss 不受影响，下一步会以系数 1.0 加回。因此纯传统 OPD 的最终目标仍然只有
+        # teacher top-k forward KL，不会混入零 advantage 产生的 PPO 项。
+        policy_loss = 0.0
+
+    # NOTE：VeRL 原版规定：纯 OPD 固定以 1.0 使用蒸馏项；只有显式启用 task reward、需要把
+    # PPO 与蒸馏混合时，distillation_loss_coef 才控制蒸馏项相对于 PPO 项的权重。
     policy_metrics.update(distill_metrics)
+    distillation_loss_coef = (
+        distillation_loss_config.distillation_loss_coef if distillation_loss_config.use_task_rewards else 1.0
+    )
+    policy_loss += distill_loss * distillation_loss_coef
     policy_metrics["distillation/loss"] = Metric(value=distill_loss, aggregation=AggregationType.SUM)
 
     return policy_loss, policy_metrics
@@ -369,9 +394,23 @@ def distillation_loss(
         pg_metrics = {f"distillation/{k[len('actor/') :]}": v for k, v in pg_metrics.items()}
         distillation_metrics.update(pg_metrics)
     else:
-        # Directly backpropagate distillation loss as a supervised loss, as in https://arxiv.org/abs/2306.13649.
+        # 按 https://arxiv.org/abs/2306.13649 的监督式蒸馏做法，直接反向传播 distillation loss。
+        # NOTE（传统 GKD-OPD）：这个分支不使用 old_log_probs、PPO ratio、clip 或 task advantage；
+        # 它只把每 token teacher top-k forward KL 按 actor 的 loss_agg_mode 聚合为标量并直接反传。
+        #
+        # NOTE（为什么这里仍读取 global_batch_info）：VeRL 原版把 dp_size、batch_num_tokens、
+        # global_batch_size 的写入放在外层 ``distillation_ppo_loss`` 随后调用的 ``ppo_loss`` 中，
+        # 并通过可变的 ActorConfig 在 micro-batch 间复用。这里保持原版读取方式，不把 PPO scaffold
+        # 误解成 GKD 算法的一部分，也不在本分支另建一套聚合协议。
+        #
+        # NOTE（全局均值的目标）：FSDP 会在切分 micro-batch 前计算整批 batch_num_tokens；当
+        # global_batch_info 已由原版 PPO scaffold 刷新后，每个 micro-batch 只贡献“本地 token loss
+        # 之和 / 全局 token 数”，engine 再累加这些贡献，得到整个 optimizer batch 的 token mean。
         if response_mask.is_nested:
             response_mask = response_mask.to_padded_tensor(False)
+
+        # NOTE：这里不是简单对“样本条数”求平均；当前 loss_agg_mode="token-mean"，所以分母是
+        # response_mask 覆盖的全局有效 token 数。只有改成 seq-* 模式时才会采用逐序列语义。
         distillation_loss = agg_loss(
             loss_mat=distillation_losses,
             loss_mask=response_mask,

@@ -56,6 +56,21 @@ def sft_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
 
 def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None):
     """Computes ppo loss from model output (log_prob, entropy, values, etc. ) and old_log_probs from data."""
+
+    # NOTE（这个标准 PPO scaffold 到底需要什么）：
+    #
+    # - 必需的可导输入只有当前 actor 前向得到的 ``model_output["log_probs"]``；梯度从这里回模型。
+    # - 必需的 batch 常量是 ``response_mask``、``old_log_probs``、``advantages``。policy loss 用
+    #   old/new logprob 形成 ratio，用 advantages 加权，再按 response_mask 聚合。
+    # - ``rollout_is_weights`` 只有启用 rollout correction 时才读取；``ref_log_prob`` 只有
+    #   ``config.use_kl_loss=True`` 时才是必需项；entropy 也只有 model_output 实际提供时才加入。
+    # - ``dp_size``、``batch_num_tokens``、``global_batch_size`` 不是 PPO reward，它们只描述完整
+    #   batch 的归一化口径。这里把它们复制进 ActorConfig，供 policy/entropy/KL 聚合使用。
+    #
+    # NOTE（为什么纯 OPD 也会进来）：本函数不知道 ``use_task_rewards``，也不决定自己的标量最终
+    # 是否保留。VeRL 原版 ``distillation_ppo_loss`` 无条件调用本函数；随后若
+    # ``use_task_rewards=False``，外层会把这里返回的整个 policy_loss 清零。Memory-OPD 因此仍需
+    # 提供 old_log_probs 和零 task advantages，但传统 GKD 的最终梯度仍只来自 distillation loss。
     log_prob = no_padding_2_padding(model_output["log_probs"], data)
     entropy = model_output.get("entropy", None)
     if entropy is not None:
