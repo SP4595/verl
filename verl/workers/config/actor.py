@@ -219,10 +219,22 @@ class ActorConfig(BaseConfig):
         if self.loss_agg_mode not in valid_loss_agg_modes:
             raise ValueError(f"Invalid loss_agg_mode: {self.loss_agg_mode}")
 
-    def validate(self, n_gpus: int, train_batch_size: int, model_config: dict = None):
-        """Validate actor configuration with runtime parameters."""
+    def validate(
+        self,
+        n_gpus: int,
+        train_batch_size: int,
+        model_config: dict = None,
+        *,
+        validate_train_batch_size: bool = True,
+    ):
+        """Validate actor configuration with runtime parameters.
+
+        ``validate_train_batch_size=False`` defers only the source-batch
+        lower-bound check to a trainer that materializes and validates rows
+        after rollout. The real source batch is still passed unchanged.
+        """
         if not self.use_dynamic_bsz:
-            if train_batch_size < self.ppo_mini_batch_size:
+            if validate_train_batch_size and train_batch_size < self.ppo_mini_batch_size:
                 raise ValueError(
                     f"train_batch_size ({train_batch_size}) must be >= "
                     f"actor.ppo_mini_batch_size ({self.ppo_mini_batch_size})"
@@ -322,9 +334,21 @@ class FSDPActorConfig(ActorConfig):
         if self.ulysses_sequence_parallel_size > 1:
             self.fsdp_config.ulysses_sequence_parallel_size = self.ulysses_sequence_parallel_size
 
-    def validate(self, n_gpus: int, train_batch_size: int, model_config: dict = None):
+    def validate(
+        self,
+        n_gpus: int,
+        train_batch_size: int,
+        model_config: dict = None,
+        *,
+        validate_train_batch_size: bool = True,
+    ):
         """Validate FSDP actor configuration with runtime parameters."""
-        super().validate(n_gpus, train_batch_size, model_config)
+        super().validate(
+            n_gpus,
+            train_batch_size,
+            model_config,
+            validate_train_batch_size=validate_train_batch_size,
+        )
         if (
             self.ulysses_sequence_parallel_size > 1
             and model_config

@@ -114,15 +114,18 @@ class CriticConfig(BaseConfig):
                         f"ppo_micro_batch_size ({self.ppo_micro_batch_size})"
                     )
 
-    def validate(self, n_gpus: int, train_batch_size: int):
+    def validate(self, n_gpus: int, train_batch_size: int, *, validate_train_batch_size: bool = True):
         """Validate critic configuration with runtime parameters.
 
         Args:
             n_gpus: Total number of GPUs available
-            train_batch_size: Training batch size from data config
+            train_batch_size: Training batch size from data config.
+            validate_train_batch_size: Whether to compare the source batch with
+                the optimizer mini-batch. A post-rollout trainer may defer only
+                this relation and validate its materialized rows at runtime.
         """
         if not self.use_dynamic_bsz:
-            if train_batch_size < self.ppo_mini_batch_size:
+            if validate_train_batch_size and train_batch_size < self.ppo_mini_batch_size:
                 raise ValueError(
                     f"train_batch_size ({train_batch_size}) must be >= "
                     f"critic.ppo_mini_batch_size ({self.ppo_mini_batch_size})"
@@ -174,9 +177,9 @@ class McoreCriticConfig(CriticConfig):
     megatron: McoreEngineConfig = field(default_factory=McoreEngineConfig)
     checkpoint: McoreCheckpointConfig = field(default_factory=McoreCheckpointConfig)
 
-    def validate(self, n_gpus: int, train_batch_size: int):
+    def validate(self, n_gpus: int, train_batch_size: int, *, validate_train_batch_size: bool = True):
         """Validate Megatron critic configuration with runtime parameters."""
-        super().validate(n_gpus, train_batch_size)
+        super().validate(n_gpus, train_batch_size, validate_train_batch_size=validate_train_batch_size)
 
     def __post_init__(self):
         """Validate Megatron critic configuration parameters."""
@@ -218,9 +221,9 @@ class FSDPCriticConfig(CriticConfig):
         # falls back to FSDP1 even when critic.strategy="fsdp2".
         object.__setattr__(self.engine, "strategy", self.strategy)
 
-    def validate(self, n_gpus: int, train_batch_size: int):
+    def validate(self, n_gpus: int, train_batch_size: int, *, validate_train_batch_size: bool = True):
         """Validate FSDP critic configuration with runtime parameters."""
-        super().validate(n_gpus, train_batch_size)
+        super().validate(n_gpus, train_batch_size, validate_train_batch_size=validate_train_batch_size)
 
         if not self.use_dynamic_bsz:
             sp_size = self.ulysses_sequence_parallel_size
@@ -298,9 +301,9 @@ class MindSpeedCriticConfig(CriticConfig):
     mindspeed: MindSpeedEngineConfig = field(default_factory=MindSpeedEngineConfig)
     checkpoint: MindSpeedCheckpointConfig = field(default_factory=MindSpeedCheckpointConfig)
 
-    def validate(self, n_gpus: int, train_batch_size: int):
+    def validate(self, n_gpus: int, train_batch_size: int, *, validate_train_batch_size: bool = True):
         """Validate mindspeed critic configuration with runtime parameters."""
-        super().validate(n_gpus, train_batch_size)
+        super().validate(n_gpus, train_batch_size, validate_train_batch_size=validate_train_batch_size)
 
 
 @dataclass
@@ -324,9 +327,9 @@ class VeOmniCriticConfig(CriticConfig):
         super().__post_init__()
         self.engine = self.veomni
 
-    def validate(self, n_gpus: int, train_batch_size: int):
+    def validate(self, n_gpus: int, train_batch_size: int, *, validate_train_batch_size: bool = True):
         """Validate VeOmni critic configuration with runtime parameters."""
-        super().validate(n_gpus, train_batch_size)
+        super().validate(n_gpus, train_batch_size, validate_train_batch_size=validate_train_batch_size)
 
         if not self.use_dynamic_bsz:
             sp_size = self.veomni.ulysses_parallel_size

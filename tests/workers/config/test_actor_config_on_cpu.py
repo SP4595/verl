@@ -247,6 +247,11 @@ class TestActorConfig(unittest.TestCase):
             config.validate(n_gpus=8, train_batch_size=128)
         self.assertIn("train_batch_size", str(cm.exception))
 
+        # A custom trainer may create variable-size training rows after rollout.
+        # The explicit flag defers only the source-batch lower-bound check;
+        # GPU/micro-batch validation below remains active.
+        config.validate(n_gpus=8, train_batch_size=128, validate_train_batch_size=False)
+
         with self.assertRaises(ValueError) as cm:
             config.validate(n_gpus=16, train_batch_size=512)
         self.assertIn("must be >= n_gpus", str(cm.exception))

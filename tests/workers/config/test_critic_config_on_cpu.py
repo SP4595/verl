@@ -302,3 +302,18 @@ class TestCriticConfig:
             optim=FSDPOptimizerConfig(lr=0.1),
         )
         assert valid_config_no_sp.ulysses_sequence_parallel_size == 1
+
+
+def test_critic_config_can_defer_source_batch_lower_bound():
+    """A post-rollout trainer validates its materialized critic rows at runtime."""
+
+    config = CriticConfig(
+        strategy="fsdp2",
+        ppo_mini_batch_size=4,
+        ppo_micro_batch_size_per_gpu=1,
+        use_dynamic_bsz=False,
+        optim=OptimizerConfig(lr=0.1),
+    )
+    with pytest.raises(ValueError, match="train_batch_size"):
+        config.validate(n_gpus=1, train_batch_size=2)
+    config.validate(n_gpus=1, train_batch_size=2, validate_train_batch_size=False)

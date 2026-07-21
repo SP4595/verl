@@ -15,10 +15,12 @@
 import unittest
 from dataclasses import dataclass, field
 
+import pytest
 from omegaconf import OmegaConf
 
 from verl.base_config import BaseConfig
 from verl.utils import omega_conf_to_dataclass
+from verl.utils.config import validate_config
 
 
 @dataclass
@@ -91,6 +93,59 @@ class TestPrintCfgCommand(unittest.TestCase):
         # Verify the output contains expected config information
         self.assertIn("critic", result.stdout)
         self.assertIn("profiler", result.stdout)
+
+
+def test_validate_config_can_defer_source_batch_checks_for_post_rollout_rows(monkeypatch):
+    """Post-rollout trainers keep generic config checks without inventing a source batch."""
+
+    validated_train_batch_sizes = []
+
+    class StubActorConfig:
+        def validate(self, n_gpus, train_batch_size, model_config, *, validate_train_batch_size=True):
+            validated_train_batch_sizes.append((train_batch_size, validate_train_batch_size))
+
+    monkeypatch.setattr("verl.utils.config.omega_conf_to_dataclass", lambda *_args, **_kwargs: StubActorConfig())
+    config = OmegaConf.create(
+        {
+            "trainer": {"n_gpus_per_node": 3, "nnodes": 1},
+            "data": {"train_batch_size": 2, "val_batch_size": None},
+            "algorithm": {"use_kl_in_reward": False},
+            "actor_rollout_ref": {
+                "actor": {
+                    "use_dynamic_bsz": False,
+                    "strategy": "fsdp",
+                    "use_kl_loss": False,
+                },
+                "model": {"lora": {}, "lora_rank": 0},
+                "rollout": {
+                    "n": 4,
+                    "name": "hf",
+                    "temperature": 1.0,
+                    "log_prob_micro_batch_size": None,
+                    "log_prob_micro_batch_size_per_gpu": 1,
+                    "val_kwargs": {"do_sample": False},
+                },
+                "ref": {
+                    "log_prob_micro_batch_size": None,
+                    "log_prob_micro_batch_size_per_gpu": 1,
+                },
+            },
+        }
+    )
+
+    # Native source-batch semantics still reject 2*4 rows on three ranks.
+    with pytest.raises(AssertionError, match="real_train_batch_size"):
+        validate_config(config, use_reference_policy=False, use_critic=False)
+
+    # A post-rollout trainer owns the eventual row count. VeRL retains the real
+    # source batch and explicitly disables only this source-level comparison.
+    validate_config(
+        config,
+        use_reference_policy=False,
+        use_critic=False,
+        defer_train_batch_size_validation=True,
+    )
+    assert validated_train_batch_sizes == [(2, False)]
 
 
 if __name__ == "__main__":

@@ -75,6 +75,7 @@ def validate_config(
     config: DictConfig,
     use_reference_policy: bool,
     use_critic: bool,
+    defer_train_batch_size_validation: bool = False,
 ) -> None:
     """Validate an OmegaConf DictConfig.
 
@@ -82,11 +83,15 @@ def validate_config(
         config (DictConfig): The OmegaConf DictConfig to validate.
         use_reference_policy (bool): is ref policy needed
         use_critic (bool): is critic needed
+        defer_train_batch_size_validation (bool): Defer checks that compare the source
+            ``data.train_batch_size`` with optimizer mini-batches. Custom trainers that
+            materialize a variable-size training batch after rollout must validate the
+            resulting rows at runtime before dispatching them to workers.
     """
     # number of GPUs total
     n_gpus = config.trainer.n_gpus_per_node * config.trainer.nnodes
 
-    if not config.actor_rollout_ref.actor.use_dynamic_bsz:
+    if not config.actor_rollout_ref.actor.use_dynamic_bsz and not defer_train_batch_size_validation:
         if config.actor_rollout_ref.actor.strategy == "megatron":
             model_parallel_size = (
                 config.actor_rollout_ref.actor.megatron.tensor_model_parallel_size
@@ -148,7 +153,12 @@ def validate_config(
 
     # Actor validation done in ActorConfig.__post_init__ and validate()
     actor_config = omega_conf_to_dataclass(config.actor_rollout_ref.actor)
-    actor_config.validate(n_gpus, config.data.train_batch_size, config.actor_rollout_ref.model)
+    actor_config.validate(
+        n_gpus,
+        config.data.train_batch_size,
+        config.actor_rollout_ref.model,
+        validate_train_batch_size=not defer_train_batch_size_validation,
+    )
 
     if not config.actor_rollout_ref.actor.use_dynamic_bsz:
         if use_reference_policy:
@@ -172,7 +182,11 @@ def validate_config(
     # critic
     if use_critic:
         critic_config = omega_conf_to_dataclass(config.critic)
-        critic_config.validate(n_gpus, config.data.train_batch_size)
+        critic_config.validate(
+            n_gpus,
+            config.data.train_batch_size,
+            validate_train_batch_size=not defer_train_batch_size_validation,
+        )
 
     if config.data.get("val_batch_size", None) is not None:
         print(
