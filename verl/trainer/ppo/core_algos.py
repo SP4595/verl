@@ -1165,12 +1165,38 @@ def agg_loss(
         loss: `a scalar torch.Tensor`
             aggregated loss
     """
+    def _divide_by_count(numerator: torch.Tensor, denominator) -> torch.Tensor:
+        """Divide by a scalar count while treating an empty logical batch as zero loss.
+
+        Memory-style trainers may pad a variable number of action rows to the
+        optimizer divisor.  With micro-batch size one, a synthetic row can form
+        an entire micro-batch whose loss mask is empty.  The row must contribute
+        a graph-connected zero, not ``0 / 0 -> NaN``.
+        """
+
+        if isinstance(denominator, torch.Tensor):
+            if denominator.numel() != 1:
+                raise ValueError("loss aggregation denominator must be a scalar")
+            count = denominator.to(device=numerator.device, dtype=numerator.dtype)
+        else:
+            count = torch.as_tensor(
+                denominator,
+                device=numerator.device,
+                dtype=numerator.dtype,
+            )
+        safe_count = count.clamp_min(1)
+        quotient = numerator / safe_count
+        return torch.where(count > 0, quotient, numerator * 0.0)
+
     if loss_agg_mode == "token-mean":
         if batch_num_tokens is None:
             if dp_size > 1:
                 raise ValueError("(global) batch_num_tokens is required when dp_size > 1")
             batch_num_tokens = loss_mask.sum()
-        loss = verl_F.masked_sum(loss_mat, loss_mask) / batch_num_tokens * dp_size
+        loss = _divide_by_count(
+            verl_F.masked_sum(loss_mat, loss_mask),
+            batch_num_tokens,
+        ) * dp_size
     elif loss_agg_mode in ["seq-mean-token-sum", "seq-mean-token-sum-norm"]:
         seq_losses = torch.sum(loss_mat * loss_mask, dim=-1)  # token-sum
         seq_mask = (torch.sum(loss_mask, dim=-1) > 0).float()  # exclude fully masked sequences
@@ -1178,7 +1204,10 @@ def agg_loss(
             if dp_size > 1:
                 raise ValueError("global_batch_size is required when dp_size > 1")
             global_batch_size = seq_mask.sum()
-        loss = verl_F.masked_sum(seq_losses, seq_mask) / global_batch_size * dp_size  # seq-mean
+        loss = _divide_by_count(
+            verl_F.masked_sum(seq_losses, seq_mask),
+            global_batch_size,
+        ) * dp_size  # seq-mean
         if loss_agg_mode == "seq-mean-token-sum-norm":
             if loss_scale_factor is None:
                 horizon = loss_mask.shape[-1]
@@ -1192,7 +1221,10 @@ def agg_loss(
             if dp_size > 1:
                 raise ValueError("global_batch_size is required when dp_size > 1")
             global_batch_size = seq_mask.sum()
-        loss = verl_F.masked_sum(seq_losses, seq_mask) / global_batch_size * dp_size  # seq-mean
+        loss = _divide_by_count(
+            verl_F.masked_sum(seq_losses, seq_mask),
+            global_batch_size,
+        ) * dp_size  # seq-mean
     else:
         raise ValueError(f"Invalid loss_agg_mode: {loss_agg_mode}")
 

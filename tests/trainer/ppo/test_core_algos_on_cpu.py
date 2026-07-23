@@ -21,11 +21,13 @@ import torch
 
 import verl.trainer.ppo.core_algos
 from verl.trainer.ppo.core_algos import (
+    agg_loss,
     compute_gae_advantage_return,
     compute_grpo_outcome_advantage,
     compute_grpo_vectorized_outcome_advantage,
     compute_rloo_outcome_advantage,
     compute_rloo_vectorized_outcome_advantage,
+    compute_value_loss,
     get_adv_estimator_fn,
     kl_penalty,
     register_adv_est,
@@ -34,6 +36,52 @@ from verl.trainer.ppo.core_algos import (
 
 def mock_test_fn():
     pass
+
+
+@pytest.mark.parametrize(
+    "loss_agg_mode",
+    [
+        "token-mean",
+        "seq-mean-token-sum",
+        "seq-mean-token-sum-norm",
+        "seq-mean-token-mean",
+    ],
+)
+def test_agg_loss_empty_mask_is_graph_connected_zero(loss_agg_mode: str):
+    loss_mat = torch.randn(1, 4, requires_grad=True)
+    loss_mask = torch.zeros_like(loss_mat, dtype=torch.bool)
+
+    loss = agg_loss(
+        loss_mat=loss_mat,
+        loss_mask=loss_mask,
+        loss_agg_mode=loss_agg_mode,
+    )
+
+    assert loss.item() == 0.0
+    assert loss.requires_grad
+    loss.backward()
+    assert torch.equal(loss_mat.grad, torch.zeros_like(loss_mat))
+
+
+def test_compute_value_loss_empty_padding_microbatch_is_finite_zero():
+    vpreds = torch.randn(1, 4, requires_grad=True)
+    values = torch.zeros_like(vpreds)
+    returns = torch.zeros_like(vpreds)
+    response_mask = torch.zeros_like(vpreds, dtype=torch.bool)
+
+    vf_loss, vf_clipfrac = compute_value_loss(
+        vpreds=vpreds,
+        values=values,
+        returns=returns,
+        response_mask=response_mask,
+        cliprange_value=0.2,
+        loss_agg_mode="token-mean",
+    )
+
+    assert vf_loss.item() == 0.0
+    assert vf_clipfrac.item() == 0.0
+    vf_loss.backward()
+    assert torch.equal(vpreds.grad, torch.zeros_like(vpreds))
 
 
 class TestRegisterAdvEst(unittest.TestCase):
