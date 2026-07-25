@@ -126,3 +126,49 @@ class AsyncTeacherLLMServerManager:
         teacher_logprobs = torch.tensor(teacher_output.extra_fields["prompt_logprobs"])
         assert teacher_ids.shape[0] == teacher_logprobs.shape[0] == len(sequence_ids)
         return teacher_ids, teacher_logprobs
+
+    async def sample_teacher_sequence_single(
+        self,
+        prompt_ids: list[int],
+        *,
+        max_tokens: int,
+        seed: int,
+        routing_key: Optional[str] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, str | None]:
+        """Sample one sequence and return its own-token log probabilities.
+
+        Memory-PPO update-query KL uses the full-memory evaluator distribution
+        as its reference.  A sampled trajectory plus its log likelihood is a
+        Monte Carlo carrier for ``KL(P_full || P_cache)`` and avoids exporting
+        a sequence-by-vocabulary logits tensor from vLLM.
+        """
+
+        if not prompt_ids:
+            raise ValueError("teacher sampling prompt_ids must not be empty")
+        if max_tokens <= 0:
+            raise ValueError("teacher sampling max_tokens must be positive")
+        teacher_key = self._resolve_teacher_key(routing_key)
+        client = self.teacher_client[teacher_key]
+        output = await client.generate(
+            request_id=uuid4().hex,
+            prompt_ids=[int(token_id) for token_id in prompt_ids],
+            sampling_params={
+                "max_tokens": int(max_tokens),
+                "temperature": 1.0,
+                "top_p": 1.0,
+                "top_k": -1,
+                "repetition_penalty": 1.0,
+                "seed": int(seed),
+                "logprobs": True,
+            },
+        )
+        if output.log_probs is None:
+            raise RuntimeError("teacher sampling did not return sampled-token logprobs")
+        token_ids = torch.tensor(output.token_ids, dtype=torch.int32)
+        token_logprobs = torch.tensor(output.log_probs, dtype=torch.float32)
+        if token_ids.shape != token_logprobs.shape:
+            raise RuntimeError(
+                "teacher sampled token/logprob shape mismatch: "
+                f"{tuple(token_ids.shape)} != {tuple(token_logprobs.shape)}"
+            )
+        return token_ids, token_logprobs, output.stop_reason
