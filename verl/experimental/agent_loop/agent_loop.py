@@ -478,6 +478,34 @@ def register(agent_name: str):
     return decorator
 
 
+def align_teacher_to_student(
+    teacher_ids: torch.Tensor,
+    teacher_logprobs: torch.Tensor,
+    *,
+    teacher_prompt_len: int,
+    student_prompt_len: int,
+    response_len: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """[memdata patch 2026-11-24] Move teacher top-k rows from ``teacher_prompt + response`` to ``prompt + response``.
+
+    Row j of the teacher output predicts token j+1, and the last row is padding. The row predicting response token i
+    is ``teacher_prompt_len - 1 + i`` in the teacher layout and ``student_prompt_len - 1 + i`` in the student layout.
+    Rows that do not predict a response token are zero; the distillation loss only reads response positions.
+    """
+    expected = teacher_prompt_len + response_len
+    if teacher_ids.shape != teacher_logprobs.shape or teacher_ids.shape[0] != expected:
+        raise ValueError(f"teacher output {tuple(teacher_ids.shape)} does not cover {teacher_prompt_len}+{response_len} tokens")
+    if teacher_prompt_len < 1 or student_prompt_len < 1 or response_len < 1:
+        raise ValueError("prompts and the response must each have at least one token")
+    start, k = teacher_prompt_len - 1, teacher_ids.shape[1]
+    head, tail = (student_prompt_len - 1, k), (1, k)
+    ids = torch.cat([teacher_ids.new_zeros(head), teacher_ids[start : start + response_len], teacher_ids.new_zeros(tail)])
+    logprobs = torch.cat(
+        [teacher_logprobs.new_zeros(head), teacher_logprobs[start : start + response_len], teacher_logprobs.new_zeros(tail)]
+    )
+    return ids, logprobs
+
+
 class AgentLoopWorker:
     """Agent loop worker takes a batch of messages and run each message in an agent loop.
 
@@ -1036,7 +1064,15 @@ class AgentLoopWorker:
         validate: bool,
         sample_kwargs: Optional[dict[str, Any]] = None,
     ) -> None:
-        """Compute teacher logprobs for single sample."""
+        """Compute teacher logprobs for single sample.
+
+        [memdata patch 2026-11-24] If the agent loop put ``teacher_prompt_ids`` in ``output.extra_fields``, the
+        teacher scores ``teacher_prompt_ids + response_ids`` (a privileged prompt, as in on-policy self-distillation)
+        instead of ``prompt_ids + response_ids``, and its rows are realigned to the student sequence. Without that
+        field the behaviour is unchanged.
+        """
+        # Pop it in every case so the long teacher prompt is never stored with the sample.
+        teacher_prompt_ids = output.extra_fields.pop("teacher_prompt_ids", None)
         if self.distillation_enabled and not validate:
             routing_key = None
             if sample_kwargs is not None:
@@ -1045,12 +1081,20 @@ class AgentLoopWorker:
                     # Non-tensor batch values arrive as 0-d numpy objects / arrays; normalize to Python.
                     routing_key = routing_value.item() if hasattr(routing_value, "item") else routing_value
             teacher_ids, teacher_logprobs = await self.teacher_server_manager.compute_teacher_logprobs_single(
-                sequence_ids=prompt_ids + response_ids,
+                sequence_ids=(prompt_ids if teacher_prompt_ids is None else list(teacher_prompt_ids)) + response_ids,
                 multi_modal_data=output.multi_modal_data,
                 mm_processor_kwargs=output.mm_processor_kwargs,
                 mm_processor_output=getattr(output, "mm_processor_output", None),
                 routing_key=routing_key,
             )
+            if teacher_prompt_ids is not None:
+                teacher_ids, teacher_logprobs = align_teacher_to_student(
+                    teacher_ids,
+                    teacher_logprobs,
+                    teacher_prompt_len=len(teacher_prompt_ids),
+                    student_prompt_len=len(prompt_ids),
+                    response_len=len(response_ids),
+                )
             output.extra_fields["teacher_ids"] = teacher_ids
             output.extra_fields["teacher_logprobs"] = teacher_logprobs
 

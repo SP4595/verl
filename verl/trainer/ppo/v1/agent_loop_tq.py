@@ -160,13 +160,19 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
         await self._compute_score(outputs, kwargs=kwargs)
 
         final_output = outputs[-1]
-        # TODO: Support output:list[AgentLoopOutput]
-        await self._compute_teacher_logprobs(
-            final_output,
-            prompt_ids=final_output.prompt_ids,
-            response_ids=final_output.response_ids,
-            validate=validate,
-            sample_kwargs=kwargs,
+        # [memdata patch 2026-11-24] Score every output of a multi-output agent loop, not only the last one
+        # (each output is its own training sample and needs its own teacher log-probs).
+        await asyncio.gather(
+            *(
+                self._compute_teacher_logprobs(
+                    item,
+                    prompt_ids=item.prompt_ids,
+                    response_ids=item.response_ids,
+                    validate=validate,
+                    sample_kwargs=kwargs,
+                )
+                for item in outputs
+            )
         )
 
         if final_output.reward_score is not None:
