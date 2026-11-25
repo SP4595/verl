@@ -264,6 +264,11 @@ class DistillationConfig(BaseConfig):
     nnodes: int = 0
     teacher_models: dict[str, DistillationTeacherModelConfig] = field(default_factory=dict)
     teacher_key: str = "data_source"
+    # Also ask the teacher during validation and report the distillation divergence of the validation rollouts
+    # (mean k1 = log p_student - log p_teacher and k2 = 0.5 * k1^2 per response token, over every output of a
+    # multi-output agent loop). Metrics only; nothing is trained on them. Off by default (verl skips the teacher in
+    # validation).
+    score_validation: bool = False
     distillation_loss: DistillationLossConfig = field(default_factory=DistillationLossConfig)
 
     def __post_init__(self):

@@ -545,6 +545,8 @@ class AgentLoopWorker:
             from verl.experimental.teacher_loop.teacher_manager import AsyncTeacherLLMServerManager
 
             self.teacher_key: str = config.distillation.teacher_key
+            # [memdata patch 2026-11-25] Optionally ask the teacher in validation too (metrics only).
+            self.distillation_score_validation = bool(config.distillation.get("score_validation", False))
             self.teacher_server_manager = AsyncTeacherLLMServerManager(
                 config=config,
                 teacher_client=teacher_client,
@@ -1070,10 +1072,13 @@ class AgentLoopWorker:
         teacher scores ``teacher_prompt_ids + response_ids`` (a privileged prompt, as in on-policy self-distillation)
         instead of ``prompt_ids + response_ids``, and its rows are realigned to the student sequence. Without that
         field the behaviour is unchanged.
+
+        [memdata patch 2026-11-25] With ``distillation.score_validation`` the teacher also scores validation
+        rollouts; the v1 worker turns those log-probs into validation metrics (nothing is trained on them).
         """
         # Pop it in every case so the long teacher prompt is never stored with the sample.
         teacher_prompt_ids = output.extra_fields.pop("teacher_prompt_ids", None)
-        if self.distillation_enabled and not validate:
+        if self.distillation_enabled and (not validate or self.distillation_score_validation):
             routing_key = None
             if sample_kwargs is not None:
                 routing_value = sample_kwargs.get(self.teacher_key)

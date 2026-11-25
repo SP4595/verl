@@ -963,6 +963,7 @@ distillation:
         response_length: ${oc.select:actor_rollout_ref.rollout.response_length}
         temperature: ${oc.select:actor_rollout_ref.rollout.temperature}
   teacher_key: data_source
+  score_validation: false
 transfer_queue:
   enable: false
   metrics:

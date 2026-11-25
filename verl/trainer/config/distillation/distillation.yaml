@@ -111,3 +111,6 @@ teacher_models:
 
 # Key to route examples to the appropriate teacher model in multi-teacher setups. Should correspond to a field in the data proto, e.g., task.
 teacher_key: data_source
+
+# Also ask the teacher during validation and log the distillation divergence (metrics only).
+score_validation: false

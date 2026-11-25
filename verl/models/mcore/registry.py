@@ -23,7 +23,7 @@ import torch
 import torch.nn as nn
 
 from .model_forward import gptmodel_forward_model_engine, model_forward_gen
-from .model_forward_fused import fused_forward_model_gen, fused_forward_model_engine
+from .model_forward_fused import fused_forward_model_engine, fused_forward_model_engine_bshd, fused_forward_model_gen
 
 
 class SupportedVLM(Enum):
@@ -69,16 +69,17 @@ def get_mcore_forward_fused_fn(hf_config) -> Callable:
         return fused_forward_model_gen(False)
 
 
-def get_mcore_forward_fused_model_engine_fn(hf_config) -> Callable:
+def get_mcore_forward_fused_model_engine_fn(hf_config, data_format: str = "thd") -> Callable:
     """
-    Get the fused forward function for no-padding inputs.
+    Get the fused forward function for the model engine: thd (no-padding) inputs by default, or padded bshd
+    inputs for models that cannot use thd packing (e.g. Qwen3.5's gated delta-net layers).
     """
     assert len(hf_config.architectures) == 1, "Only one architecture is supported for now"
-    if hf_config.architectures[0] in supported_vlm:
-        return fused_forward_model_engine(True)
-    else:
-        # default to language model
-        return fused_forward_model_engine(False)
+    assert data_format in ("thd", "bshd"), "data_format must be 'thd' or 'bshd'"
+    vision_model = hf_config.architectures[0] in supported_vlm
+    if data_format == "bshd":
+        return fused_forward_model_engine_bshd(vision_model)
+    return fused_forward_model_engine(vision_model)
 
 
 # ruff: noqa

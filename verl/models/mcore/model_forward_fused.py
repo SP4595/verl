@@ -31,7 +31,14 @@ from megatron.core.utils import deprecate_inference_params
 from packaging import version
 from torch import Tensor
 
-from verl.models.mcore.util import build_vlm_attn_mask_thd, preprocess_packed_seqs, preprocess_thd_engine
+from verl.models.mcore.util import (
+    build_vlm_attn_mask_bshd,
+    build_vlm_attn_mask_thd,
+    postprocess_bshd_engine,
+    preprocess_bshd_engine,
+    preprocess_packed_seqs,
+    preprocess_thd_engine,
+)
 from verl.utils.kernel.linear_cross_entropy import linear_cross_entropy
 from verl.utils.megatron_utils import unwrap_model
 from verl.utils.model import CausalLMOutputForPPO
@@ -40,7 +47,12 @@ from .util import postprocess_packed_seqs_for_dict_output, postprocess_thd_engin
 
 _FUSED_FORWARD_MODE_ATTR = "_verl_fused_forward_mode"
 _HOOK_MODE = "hook"
+# The model's ``forward`` does not take ``output_processor`` (e.g. Megatron-Bridge's Qwen3VLGPTModel, used by
+# Qwen3.5), but its ``_postprocess`` does (Megatron Core >= 0.18). We wrap ``_postprocess`` and hand it the
+# processor through an attribute set around the call, so the model's own forward (mRoPE, deepstack) still runs.
+_POSTPROCESS_MODE = "postprocess"
 _LEGACY_MODE = "legacy"
+_PENDING_OUTPUT_PROCESSOR_ATTR = "_verl_pending_output_processor"
 
 
 def _supports_output_processor_hook(patching_model: torch.nn.Module) -> bool:
@@ -57,8 +69,21 @@ def _supports_output_processor_hook(patching_model: torch.nn.Module) -> bool:
     return {"output_processor", "output_processor_context"}.issubset(parameters)
 
 
+def _supports_postprocess_hook(patching_model: torch.nn.Module) -> bool:
+    """Check whether ``_postprocess`` takes the output-processor hook even though ``forward`` does not."""
+    postprocess = getattr(patching_model, "_postprocess", None)
+    if postprocess is None:
+        return False
+    parameters = inspect.signature(postprocess).parameters
+    return {"output_processor", "output_processor_context"}.issubset(parameters)
+
+
 def _resolve_fused_forward_mode(patching_model: torch.nn.Module) -> str:
-    return _HOOK_MODE if _supports_output_processor_hook(patching_model) else _LEGACY_MODE
+    if _supports_output_processor_hook(patching_model):
+        return _HOOK_MODE
+    if _supports_postprocess_hook(patching_model):
+        return _POSTPROCESS_MODE
+    return _LEGACY_MODE
 
 
 def _get_fused_forward_mode(model: torch.nn.Module) -> str:
@@ -66,11 +91,24 @@ def _get_fused_forward_mode(model: torch.nn.Module) -> str:
     mode = getattr(model, _FUSED_FORWARD_MODE_ATTR, None)
     if mode is None and hasattr(model, "language_model"):
         mode = getattr(model.language_model, _FUSED_FORWARD_MODE_ATTR, None)
-    return mode if mode in (_HOOK_MODE, _LEGACY_MODE) else _LEGACY_MODE
+    return mode if mode in (_HOOK_MODE, _POSTPROCESS_MODE, _LEGACY_MODE) else _LEGACY_MODE
 
 
 def _use_output_processor_hook(model: torch.nn.Module) -> bool:
-    return _get_fused_forward_mode(model) == _HOOK_MODE
+    return _get_fused_forward_mode(model) in (_HOOK_MODE, _POSTPROCESS_MODE)
+
+
+def _call_with_output_processor(model: torch.nn.Module, forward_kwargs: dict, temperature: float):
+    """Run ``model`` with ``fused_output_processor`` at its postprocess boundary (hook or postprocess mode)."""
+    context = FusedOutputProcessorContext(temperature=temperature)
+    if _get_fused_forward_mode(model) == _HOOK_MODE:
+        return model(**forward_kwargs, output_processor=fused_output_processor, output_processor_context=context)
+    patched = _get_patching_model(model)
+    setattr(patched, _PENDING_OUTPUT_PROCESSOR_ATTR, (fused_output_processor, context))
+    try:
+        return model(**forward_kwargs)
+    finally:
+        setattr(patched, _PENDING_OUTPUT_PROCESSOR_ATTR, None)
 
 
 @dataclass
@@ -107,14 +145,29 @@ def fused_output_processor(
     weight = output_weight if output_weight is not None else output_layer.weight
 
     temperature = context.temperature
+    # Megatron's hidden states are sequence-first [s, b, h] while labels are batch-first [b, s]. The kernel flattens
+    # both, so with b > 1 (padded bshd micro-batches) the labels must be put in the same [s, b] order first, and the
+    # results turned back to [b, s]. With b == 1 (thd packing, or bshd with one sequence) both orders agree and the
+    # outputs keep their original flat shape.
+    batch_first = (
+        hidden_states.dim() == 3
+        and labels is not None
+        and labels.dim() == 2
+        and hidden_states.shape[1] > 1
+        and tuple(labels.shape) == (hidden_states.shape[1], hidden_states.shape[0])
+    )
     logprobs, entropy = linear_cross_entropy(
         hidden_states,
         weight,
-        labels,
+        labels.transpose(0, 1).contiguous() if batch_first else labels,
         temperature,
         "none",
         parallel_state.get_tensor_model_parallel_group(),
     )
+    if batch_first:
+        seq_len, batch_size = hidden_states.shape[:2]
+        logprobs = logprobs.view(seq_len, batch_size).transpose(0, 1)
+        entropy = entropy.view(seq_len, batch_size).transpose(0, 1)
 
     if has_config_logger_enabled(config):
         payload = OrderedDict(
@@ -159,6 +212,20 @@ def patch_fused_forward(model: torch.nn.Module):
     if mode == _HOOK_MODE:
         return
 
+    if mode == _POSTPROCESS_MODE:
+        if not hasattr(model, "postprocess_backup"):
+            model.postprocess_backup = model._postprocess
+            setattr(model, _PENDING_OUTPUT_PROCESSOR_ATTR, None)
+
+            def _postprocess_with_pending_processor(*args, **kwargs):
+                pending = getattr(model, _PENDING_OUTPUT_PROCESSOR_ATTR, None)
+                if pending is not None and kwargs.get("output_processor") is None:
+                    kwargs["output_processor"], kwargs["output_processor_context"] = pending
+                return model.postprocess_backup(*args, **kwargs)
+
+            model._postprocess = _postprocess_with_pending_processor
+        return
+
     assert version.parse(mcore.__version__) >= version.parse("0.13.0"), (
         "Fused forward patching requires mecore >= 0.13.0"
     )
@@ -170,6 +237,11 @@ def patch_fused_forward(model: torch.nn.Module):
 def unpatch_fused_forward(model: torch.nn.Module):
     model = _get_patching_model(model)
     if model is None or _get_fused_forward_mode(model) == _HOOK_MODE:
+        return
+    if _get_fused_forward_mode(model) == _POSTPROCESS_MODE:
+        if hasattr(model, "postprocess_backup"):
+            model._postprocess = model.postprocess_backup
+            delattr(model, "postprocess_backup")
         return
     if hasattr(model, "forward_backup"):
         model.forward = model.forward_backup
@@ -230,11 +302,7 @@ def fused_forward_model_gen(vision_model: bool = False):
 
         if _use_output_processor_hook(model):
             input_args.pop("temperature", None)
-            output_orig: CausalLMOutputForPPO = model(
-                **input_args,
-                output_processor=fused_output_processor,
-                output_processor_context=FusedOutputProcessorContext(temperature=temperature),
-            )
+            output_orig: CausalLMOutputForPPO = _call_with_output_processor(model, input_args, temperature)
         else:
             output_orig: CausalLMOutputForPPO = model(**input_args)
 
@@ -327,11 +395,7 @@ def fused_forward_model_engine(vision_model: bool = False):
             **model_kwargs,
         )
         if _use_output_processor_hook(model):
-            output_orig: CausalLMOutputForPPO = model(
-                **forward_kwargs,
-                output_processor=fused_output_processor,
-                output_processor_context=FusedOutputProcessorContext(temperature=temperature),
-            )
+            output_orig: CausalLMOutputForPPO = _call_with_output_processor(model, forward_kwargs, temperature)
         else:
             output_orig: CausalLMOutputForPPO = model(temperature=temperature, **forward_kwargs)
 
@@ -371,6 +435,91 @@ def fused_forward_model_engine(vision_model: bool = False):
         return output
 
     return fused_forward_model_engine_inner
+
+
+def fused_forward_model_engine_bshd(vision_model: bool = False):
+    """Fused log-probs for padded (bshd) inputs, for models that cannot use thd packing.
+
+    Megatron-LM does not support packed sequences for Qwen3.5's gated delta-net layers yet, so those models run
+    with ``use_remove_padding=False``. The unfused bshd path then materializes the full ``[b, s, vocab]`` logits
+    (248k vocab for Qwen3.5: ~16 GB at 11k tokens with the fp32 copy). This function mirrors the bshd branch of
+    ``gptmodel_forward_model_engine`` but asks the model to return log-probs (and entropy) computed by the chunked
+    ``linear_cross_entropy`` kernel at the postprocess boundary, so the logits are never materialized.
+    Requires the output-processor hook (hook or postprocess mode); the legacy forward patch is thd-only.
+    """
+
+    def fused_forward_model_engine_bshd_inner(
+        model,
+        input_ids: Tensor,
+        labels: Tensor,
+        multi_modal_inputs: dict,
+        temperature: float,
+        calculate_entropy: bool,
+        pad_token_id: int,
+        cp_layout: str = "zigzag",
+        local_cp_size: int | None = None,
+        router_padding_mask: Tensor | None = None,
+        pad_to_length_bucket: int | None = None,
+        forced_max_seqlen: int | None = None,
+    ):
+        assert local_cp_size is None, "dynamic CP is not supported for bshd format"
+        assert router_padding_mask is None, "router padding mask is not supported for fused bshd"
+        assert pad_to_length_bucket is None, "pad_to_length is not supported for bshd format"
+        if not _use_output_processor_hook(model):
+            raise NotImplementedError(
+                "fused kernels with use_remove_padding=False need the Megatron output-processor hook "
+                "(Megatron Core >= 0.18); the legacy forward patch only supports thd"
+            )
+        pre_process = unwrap_model(model).pre_process
+        post_process = unwrap_model(model).post_process
+        use_fp8_padding = unwrap_model(model).config.fp8 in ["e4m3", "hybrid"]
+        batch_size = input_ids.shape[0]
+
+        input_ids_bshd, attention_mask_bshd, position_ids_bshd = preprocess_bshd_engine(
+            input_ids, pre_process=pre_process, use_fp8_padding=use_fp8_padding, forced_max_seqlen=forced_max_seqlen
+        )
+        labels_bshd = preprocess_bshd_engine(
+            labels, pre_process=True, need_roll=True, use_fp8_padding=use_fp8_padding, forced_max_seqlen=forced_max_seqlen
+        )[0].contiguous()
+
+        model_kwargs = {}
+        if "pixel_values" in multi_modal_inputs:
+            model_kwargs["pixel_values"] = multi_modal_inputs["pixel_values"].to(input_ids.device)
+        if "image_grid_thw" in multi_modal_inputs:
+            model_kwargs["image_grid_thw"] = multi_modal_inputs["image_grid_thw"].to(input_ids.device)
+        if "pixel_values_videos" in multi_modal_inputs:
+            model_kwargs["pixel_values_videos"] = multi_modal_inputs["pixel_values_videos"].to(input_ids.device)
+        if "video_grid_thw" in multi_modal_inputs:
+            model_kwargs["video_grid_thw"] = multi_modal_inputs["video_grid_thw"].to(input_ids.device)
+
+        # Same as the unfused bshd branch: VLMs take bshd input_ids plus their own attention mask.
+        if vision_model:
+            input_ids_bshd, attention_mask = build_vlm_attn_mask_bshd(
+                input_ids, batch_size, pad_token_id, forced_max_seqlen=forced_max_seqlen
+            )
+        else:
+            attention_mask = attention_mask_bshd
+
+        forward_kwargs = dict(
+            input_ids=input_ids_bshd,
+            attention_mask=attention_mask,
+            position_ids=None if vision_model else position_ids_bshd,
+            labels=labels_bshd,
+            **model_kwargs,
+        )
+        output_orig: CausalLMOutputForPPO = _call_with_output_processor(model, forward_kwargs, temperature)
+        if not post_process:
+            return output_orig
+
+        seq_len = labels_bshd.shape[1]
+        log_probs = output_orig.log_probs.reshape(batch_size, seq_len)
+        output = {"log_probs": postprocess_bshd_engine(log_probs, attention_mask_bshd, post_process=post_process)}
+        if calculate_entropy:
+            entropy = output_orig.entropy.reshape(batch_size, seq_len)
+            output["entropy"] = postprocess_bshd_engine(entropy, attention_mask_bshd, post_process=post_process)
+        return output
+
+    return fused_forward_model_engine_bshd_inner
 
 
 def _fused_GPTModel_forward(

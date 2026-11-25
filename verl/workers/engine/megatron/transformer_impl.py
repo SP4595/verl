@@ -523,18 +523,32 @@ class MegatronEngine(BaseEngine):
         if not self.engine_config.use_fused_kernels:
             return
 
-        if not self.engine_config.use_remove_padding or self.is_value_model or self.model_config.mtp.enable:
+        if self.is_value_model or self.model_config.mtp.enable:
             logger.warning_once(
-                "Fused kernels require remove-padding and are not supported for value models or when MTP is enabled "
-                "in Megatron engine; disabling."
+                "Fused kernels are not supported for value models or when MTP is enabled in Megatron engine; disabling."
             )
             self.engine_config.use_fused_kernels = False
             return
 
-        from verl.models.mcore.model_forward_fused import patch_fused_forward
+        from verl.models.mcore.model_forward_fused import (
+            _use_output_processor_hook,
+            patch_fused_forward,
+            unpatch_fused_forward,
+        )
 
         for model in self.module:
             patch_fused_forward(model)
+
+        # Padded (bshd) inputs, e.g. Qwen3.5 whose gated delta-net layers cannot use thd packing yet: the fused
+        # bshd forward needs the Megatron output-processor hook; the legacy forward patch is thd-only.
+        if not self.engine_config.use_remove_padding and not all(_use_output_processor_hook(m) for m in self.module):
+            logger.warning_once(
+                "Fused kernels without remove-padding need the Megatron output-processor hook "
+                "(Megatron Core >= 0.18); disabling."
+            )
+            for model in self.module:
+                unpatch_fused_forward(model)
+            self.engine_config.use_fused_kernels = False
 
     def _build_optimizer(self):
         from verl.utils.megatron.optimizer import get_megatron_optimizer, init_megatron_optim_config
@@ -1337,7 +1351,15 @@ class MegatronEngineWithLMHead(MegatronEngine):
         if use_fused_kernels:
             from verl.models.mcore import get_mcore_forward_fused_model_engine_fn
 
-            fused_forward_fn = get_mcore_forward_fused_model_engine_fn(self.model_config.hf_config)
+            fused_data_format = "thd" if self.engine_config.use_remove_padding else "bshd"
+            fused_forward_fn = get_mcore_forward_fused_model_engine_fn(
+                self.model_config.hf_config, data_format=fused_data_format
+            )
+            fused_kwargs = {}
+            if fused_data_format == "bshd":
+                fused_kwargs["forced_max_seqlen"] = tu.get_non_tensor_data(
+                    data=batch, key="forced_max_seqlen", default=None
+                )
             output = fused_forward_fn(
                 model=model,
                 input_ids=input_ids,
@@ -1350,6 +1372,7 @@ class MegatronEngineWithLMHead(MegatronEngine):
                 local_cp_size=local_cp_size,
                 router_padding_mask=router_padding_mask,
                 pad_to_length_bucket=pad_to_length_bucket,
+                **fused_kwargs,
             )
         else:
             if not isinstance(temperature, torch.Tensor):

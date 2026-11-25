@@ -49,6 +49,34 @@ async def _settle_session_tasks(tasks: list[asyncio.Task[Any]]) -> list[BaseExce
     return [result for result in results if isinstance(result, BaseException)]
 
 
+def validation_distillation_metrics(outputs: list[AgentLoopOutput]) -> dict[str, float]:
+    """Per-token distillation divergence of one validation session (memdata patch 2026-11-25).
+
+    For response token i the student log-prob is the rollout's ``response_logprobs[i]`` and the teacher log-prob is
+    row ``len(prompt_ids) - 1 + i`` of ``teacher_logprobs`` (the row that predicts token i; with top-k off the
+    teacher returns one log-prob per row). Returns the means of k1 = log p_s - log p_t and k2 = 0.5 * k1^2 over all
+    masked response tokens of all outputs, and the token count. Pops the teacher tensors from every output.
+    """
+    k1_sum, k2_sum, tokens = 0.0, 0.0, 0
+    for item in outputs:
+        teacher = item.extra_fields.pop("teacher_logprobs", None)
+        item.extra_fields.pop("teacher_ids", None)
+        if teacher is None or item.response_logprobs is None or not item.response_ids:
+            continue
+        teacher = torch.as_tensor(teacher, dtype=torch.float32)
+        start, length = len(item.prompt_ids) - 1, len(item.response_ids)
+        teacher_rows = teacher[start : start + length, 0]
+        student = torch.as_tensor(item.response_logprobs[:length], dtype=torch.float32)
+        mask = torch.as_tensor(item.response_mask[:length], dtype=torch.float32)
+        diff = (student - teacher_rows) * mask
+        k1_sum += float(diff.sum())
+        k2_sum += float(0.5 * (diff * diff).sum())
+        tokens += int(mask.sum())
+    if tokens == 0:
+        return {}
+    return {"distill_val_k1": k1_sum / tokens, "distill_val_k2": k2_sum / tokens, "distill_val_tokens": float(tokens)}
+
+
 @ray.remote
 class AgentLoopWorkerTQ(AgentLoopWorker):
     def __init__(self, *args, **kwargs):
@@ -174,6 +202,15 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
                 for item in outputs
             )
         )
+        # [memdata patch 2026-11-25] Validation with distillation.score_validation: turn the teacher log-probs into
+        # metrics of the whole session (every output), stored on the final output's reward_extra_info, which is the
+        # one the v1 validation loop reads. The teacher tensors are then dropped (not needed for validation).
+        if validate and getattr(self, "distillation_score_validation", False):
+            summary = validation_distillation_metrics(outputs)
+            final_output.extra_fields["reward_extra_info"] = {
+                **final_output.extra_fields.get("reward_extra_info", {}),
+                **summary,
+            }
 
         if final_output.reward_score is not None:
             for output in outputs[:-1]:
