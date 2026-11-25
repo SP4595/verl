@@ -1613,9 +1613,15 @@ class PPOTrainer(ABC):
 
         # If there is an actor update, the batch should align with actor PPO mini-batches too.
         if self.config.trainer.critic_warmup <= self.global_steps:
-            actor_global_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
-            actor_global_mini_batch_size *= self.config.actor_rollout_ref.rollout.n
-            required_multiple = math.lcm(required_multiple, actor_global_mini_batch_size)
+            updates_per_step = self.config.actor_rollout_ref.actor.get("ppo_updates_per_step", None)
+            if updates_per_step:
+                # [memdata patch 2026-11-25] A fixed number of mini-batches per step: each dp rank's share must split
+                # into that many equal mini-batches, so the global batch must be a multiple of dp_size * updates.
+                required_multiple = math.lcm(required_multiple, dp_size * updates_per_step)
+            else:
+                actor_global_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
+                actor_global_mini_batch_size *= self.config.actor_rollout_ref.rollout.n
+                required_multiple = math.lcm(required_multiple, actor_global_mini_batch_size)
 
         # Notice lcm(a, b, c) == lcm(lcm(a, b), c), so it is optimal.
         return required_multiple
@@ -1859,12 +1865,22 @@ class PPOTrainer(ABC):
                 and not distillation_loss_cfg.use_task_rewards
                 and not distillation_loss_cfg.use_policy_gradient
             )
+        # [memdata patch 2026-11-25] With ppo_updates_per_step, split this step's samples (padding included, see
+        # _get_required_batch_multiple) into that many mini-batches instead of mini-batches of ppo_mini_batch_size
+        # samples. Multi-output agent loops produce a varying number of samples per prompt, so a sample-count
+        # mini-batch gives a varying number of updates per step. global_batch_size (the loss normaliser) is then the
+        # number of samples in one mini-batch.
+        updates_per_step = self.config.actor_rollout_ref.actor.get("ppo_updates_per_step", None)
+        mini_batch_info = {"global_batch_size": ppo_mini_batch_size, "mini_batch_size": ppo_mini_batch_size}
+        if updates_per_step:
+            if len(batch) % updates_per_step != 0:
+                raise ValueError(f"batch of {len(batch)} samples does not split into {updates_per_step} mini-batches")
+            mini_batch_info = {"global_batch_size": len(batch) // updates_per_step, "num_mini_batch": updates_per_step}
         extra_info = {
             "calculate_entropy": calculate_entropy,
             "distillation_use_topk": distillation_use_topk,
             "distillation_only": distillation_only,
-            "global_batch_size": ppo_mini_batch_size,
-            "mini_batch_size": ppo_mini_batch_size,
+            **mini_batch_info,
             "epochs": self.config.actor_rollout_ref.actor.ppo_epochs,
             "seed": self.config.actor_rollout_ref.actor.data_loader_seed,
             "dataloader_kwargs": {"shuffle": self.config.actor_rollout_ref.actor.shuffle},

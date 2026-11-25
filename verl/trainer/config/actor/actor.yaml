@@ -17,6 +17,9 @@ strategy: ???
 # Split each sample into sub-batches of this size for PPO
 ppo_mini_batch_size: 256
 
+# [memdata patch] Split each step's samples into this many mini-batches (one update each); null = by ppo_mini_batch_size
+ppo_updates_per_step: null
+
 # [Deprecated] Global micro batch size
 ppo_micro_batch_size: null
 

@@ -109,11 +109,23 @@ def get_distillation_loss_settings(loss_name: str) -> DistillationLossSettings:
 def compute_distillation_loss_range(
     distillation_losses: torch.Tensor, response_mask: torch.Tensor
 ) -> dict[str, Metric]:
-    """Compute min and max distillation loss over valid response tokens."""
+    """Compute min and max distillation loss over valid response tokens.
+
+    [memdata patch 2026-11-25] A micro-batch can hold no valid response token: the trainer pads the batch with
+    synthetic no-op samples (``upsample_batch_to_divisible_size``, response_mask all zero), and with one sample per
+    micro-batch such a micro-batch is all padding. ``min()`` of an empty tensor raises, so report +inf / -inf
+    instead. MIN / MAX aggregation then ignores them, and every dp rank still reports one value per micro-batch
+    (``Metric.aggregate_dp`` needs equal counts), which skipping the metric would break.
+    """
     if response_mask.is_nested:
         distillation_losses_response = distillation_losses[response_mask.bool().to_padded_tensor(False)]
     else:
         distillation_losses_response = distillation_losses[response_mask.bool()]
+    if distillation_losses_response.numel() == 0:
+        return {
+            "distillation/loss_min": Metric(AggregationType.MIN, float("inf")),
+            "distillation/loss_max": Metric(AggregationType.MAX, float("-inf")),
+        }
     return {
         "distillation/loss_min": Metric(AggregationType.MIN, distillation_losses_response.min()),
         "distillation/loss_max": Metric(AggregationType.MAX, distillation_losses_response.max()),

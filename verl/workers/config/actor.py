@@ -110,6 +110,11 @@ class ActorConfig(BaseConfig):
     Args:
         strategy (str): Training strategy. Must be specified.
         ppo_mini_batch_size (int): Mini-batch size for PPO training.
+        ppo_updates_per_step (Optional[int]): [memdata patch 2026-11-25] If set, split each training step's
+            samples into this many mini-batches (one optimizer update each), however many samples the
+            agent loop produced. Multi-output agent loops make the sample count vary per step, so
+            ``ppo_mini_batch_size`` (counted in samples) would give a varying number of updates. None keeps
+            the default sample-count mini-batches.
         ppo_micro_batch_size (Optional[int]): Micro-batch size for PPO training.
             If None, uses ppo_micro_batch_size_per_gpu.
         ppo_micro_batch_size_per_gpu (Optional[int]): Micro-batch size per GPU for PPO training.
@@ -149,6 +154,7 @@ class ActorConfig(BaseConfig):
 
     strategy: str = MISSING
     ppo_mini_batch_size: int = 256
+    ppo_updates_per_step: Optional[int] = None
     ppo_micro_batch_size: Optional[int] = None  # deprecate
     ppo_micro_batch_size_per_gpu: Optional[int] = None
     ppo_infer_micro_batch_size_per_gpu: Optional[int] = None
@@ -218,6 +224,8 @@ class ActorConfig(BaseConfig):
         ]
         if self.loss_agg_mode not in valid_loss_agg_modes:
             raise ValueError(f"Invalid loss_agg_mode: {self.loss_agg_mode}")
+        if self.ppo_updates_per_step is not None and self.ppo_updates_per_step < 1:
+            raise ValueError(f"ppo_updates_per_step must be >= 1 or None, got {self.ppo_updates_per_step}")
 
     def validate(self, n_gpus: int, train_batch_size: int, model_config: dict = None):
         """Validate actor configuration with runtime parameters."""
