@@ -219,12 +219,12 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
         timing_raw = {}
 
         # Create the initial batch from the data loader
-        batch = DataProto.from_single_dict(batch_dict)
+        batch = DataProto.from_single_dict(batch_dict) # batch 是数据传输类，可以看作总线类型
 
         # add uid to batch
         batch.non_tensor_batch["uid"] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object)
 
-        gen_batch = self._get_gen_batch(batch)
+        gen_batch = self._get_gen_batch(batch) 
 
         # pass global_steps to trace
         gen_batch.meta_info["global_steps"] = self.global_steps
@@ -235,7 +235,10 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
             gen_batch_output = await self.async_rollout_manager.generate_sequences(gen_batch_output)
 
         # repeat to align with repeated responses in rollout
+        # 有的时候一个sample要rollout多次，我们干脆直接batch之间诶repete了
         batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+        
+        # 添加 union
         batch = batch.union(gen_batch_output)
 
         if "response_mask" not in batch.batch.keys():
@@ -314,6 +317,10 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
         # across epoch iterator
         continuous_iterator = self._create_continuous_iterator()
         # Start the first asynchronous generation task.
+        
+        # 异步batch提取
+        
+        # batch data future 就是传入
         batch_data_future = asyncio.create_task(self._async_gen_next_batch(continuous_iterator))
         while batch_data_future is not None:
             batch_data_future = await self.fit_step(batch_data_future, continuous_iterator)
@@ -343,6 +350,8 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
         self._fit_start_profile()
 
         with marked_timer("step", self.timing_raw):
+            
+            
             batch, batch_data_future = await self._fit_generate(batch_data_future, continuous_iterator)
 
             # await asyncio.sleep(0) ensures:
