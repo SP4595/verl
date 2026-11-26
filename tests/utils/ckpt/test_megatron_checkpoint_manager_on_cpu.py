@@ -23,6 +23,7 @@ Uses real megatron.core with gloo backend on a single CPU process.
 import os
 import shutil
 import tempfile
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -537,6 +538,45 @@ class TestLoadCheckpointDispatch:
         assert set(calls) == {"extra"}
         assert "rng_state" in calls["extra"]
         mgr.model[0].sharded_state_dict.assert_not_called()
+
+    @patch(_PATCH_LOAD_META, return_value=None)
+    @patch("verl.utils.checkpoint.megatron_checkpoint_manager.load_dist_checkpointing")
+    def test_peft_resume_maps_optimizer_to_live_params(self, mock_load_dc, _mock_meta):
+        """[memdata patch 2026-11-26] Resuming PEFT (LoRA) model shards + optimizer.
+
+        Megatron's torch_dist load rebinds ``.data`` on the ShardedTensors it was given
+        (``sh_ten.data = sh_ten.data.detach()``), and the optimizer maps its params to model
+        shards by ``id(sh_ten.data)``. The optimizer must therefore get a model sharded
+        state dict built after the model load, whose ``.data`` are still the parameters;
+        with the consumed one, Megatron raises ``KeyError: 0`` (seen resuming LoRA + Muon).
+        """
+        _make_v2_layout(self.ckpt_path, "model", "optimizer")
+        param = torch.nn.Parameter(torch.zeros(2))
+        mgr = _make_manager(load_contents=["model", "optimizer"], peft_cls=MagicMock())
+        # A fresh shard object around the live parameter on every call, like model.sharded_state_dict().
+        mgr.model[0].sharded_state_dict.side_effect = lambda **_: {"layer.adapter.weight": SimpleNamespace(data=param)}
+
+        def fake_load(sharded_state_dict, ckpt_dir):
+            if "model" in sharded_state_dict:
+                for shard in sharded_state_dict["model"].values():
+                    shard.data = shard.data.detach()  # what the torch_dist strategy does
+                return {"model": {"layer.adapter.weight": torch.zeros(2)}}
+            return {"optimizer": {"step": 7}, "lr_scheduler": {"last_epoch": 7}}
+
+        def optimizer_sharded_state_dict(model_sharded_state_dict, **_):
+            # Megatron's get_param_id_to_sharded_param_map: match optimizer params by id(shard.data).
+            if not any(shard.data is param for shard in model_sharded_state_dict["model"].values()):
+                raise KeyError(0)
+            return {"step": 7}
+
+        mock_load_dc.side_effect = fake_load
+        mgr.optimizer.sharded_state_dict.side_effect = optimizer_sharded_state_dict
+        with patch.object(mgr, "_maybe_filter_peft_state_dict", side_effect=lambda sd: sd):
+            mgr.load_checkpoint(self.ckpt_path)
+
+        assert set(_load_calls_by_subdir(mock_load_dc)) == {"model", "optimizer"}
+        mgr.model[0].load_state_dict.assert_called_once()
+        mgr.optimizer.load_state_dict.assert_called_once_with({"step": 7})
 
     @patch(_PATCH_LOAD_META, return_value=None)
     @patch("verl.utils.checkpoint.megatron_checkpoint_manager.load_dist_checkpointing")

@@ -913,7 +913,9 @@ class MegatronCheckpointManager(BaseCheckpointManager):
             model_sharded_state_dict = self._build_model_sharded_state_dict(metadata)
 
         # ── Load model weights ──────────────────────────────────────────────
+        model_shards_consumed = False
         if self.should_load_dist_ckpt_model or (self.should_load_hf_model and self.peft_cls is not None):
+            model_shards_consumed = True
             model_sd = self._maybe_filter_peft_state_dict(dict(model_sharded_state_dict))
             loaded_model = load_dist_checkpointing(
                 sharded_state_dict=model_sd,
@@ -942,6 +944,16 @@ class MegatronCheckpointManager(BaseCheckpointManager):
 
         # ── Load optimizer / LR scheduler ───────────────────────────────────
         if self.should_load_optimizer:
+            # [memdata patch 2026-11-26] Loading the model shards above rebinds ``.data`` on the very ShardedTensor
+            # objects in ``model_sharded_state_dict`` (``dict(...)`` and dist_checkpointing's load_preprocess copy only
+            # the containers; the torch_dist strategy then does ``sh_ten.data = sh_ten.data.detach()`` / ``.view(...)``,
+            # megatron/core/dist_checkpointing/strategies/torch.py). The optimizer maps its parameters to model shards
+            # by ``id(sh_ten.data)`` (get_param_id_to_sharded_param_map), so with the consumed dict nothing matches and
+            # Float16OptimizerWithFloat16Params.sharded_state_dict raises ``KeyError: 0``. Seen resuming a LoRA + Muon
+            # run (PEFT adapters load from model/dist_ckpt). Saving is unaffected: it builds the optimizer state dict
+            # before anything is written. Rebuild the model sharded state dict so its ``.data`` are the parameters.
+            if model_shards_consumed:
+                model_sharded_state_dict = self._build_model_sharded_state_dict(metadata)
             optim_sd = self._build_optimizer_state_dict(model_sharded_state_dict, metadata, is_loading=True)
             loaded_optim = load_dist_checkpointing(
                 sharded_state_dict=optim_sd,
