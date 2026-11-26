@@ -202,6 +202,9 @@ class TrainingWorker(Worker, DistProfilerExtension):
         grad_norm = metrics.pop("grad_norm", None)
         if isinstance(grad_norm, torch.Tensor):
             grad_norm = grad_norm.detach().item()
+        grad_norm_after_clip = metrics.pop("grad_norm_after_clip", None)  # [memdata patch 2026-11-26]
+        if isinstance(grad_norm_after_clip, torch.Tensor):
+            grad_norm_after_clip = grad_norm_after_clip.detach().item()
         lr = metrics.pop("lr", None)
 
         # For other metrics, we perform all gather in dp group (only if DP > 1)
@@ -212,6 +215,8 @@ class TrainingWorker(Worker, DistProfilerExtension):
         final_metrics["loss"] = loss
         if grad_norm is not None:
             final_metrics["grad_norm"] = grad_norm
+        if grad_norm_after_clip is not None:
+            final_metrics["grad_norm_after_clip"] = grad_norm_after_clip
         if lr is not None:
             final_metrics["lr"] = lr
 

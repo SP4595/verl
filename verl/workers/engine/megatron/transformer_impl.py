@@ -712,6 +712,11 @@ class MegatronEngine(BaseEngine):
         if getattr(self, "_distillation_use_topk_active", False):
             get_torch_device().empty_cache()
         update_successful, grad_norm, num_zeros_in_grad = self.optimizer.step()
+        # [memdata patch 2026-11-26] grad_norm above is the norm BEFORE clipping. Record the norm after clipping too,
+        # so the logs show clipping took effect (researcher: "grad norm clip 成1"). ChainedOptimizer.step clips the
+        # main grads in place and the inner step (Muon / Adam) reads but never modifies them, so the norm of the grads
+        # after the step is the clipped norm (<= clip_grad when clipping is on).
+        self.grad_norm_after_clip = self.optimizer.get_grad_norm()
 
         if update_successful:
             # allgather already execute in optimizer.step in new megatron

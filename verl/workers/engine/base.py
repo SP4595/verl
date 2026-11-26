@@ -129,6 +129,10 @@ class BaseEngine:
         if self.is_mp_src_rank_with_outputs():
             assert "grad_norm" not in outputs["metrics"]
             outputs["metrics"]["grad_norm"] = grad_norm
+            # [memdata patch 2026-11-26] engines that record the clipped norm (Megatron) also report it.
+            grad_norm_after_clip = getattr(self, "grad_norm_after_clip", None)
+            if grad_norm_after_clip is not None:
+                outputs["metrics"]["grad_norm_after_clip"] = grad_norm_after_clip
         return outputs
 
     def infer_batch(self, data: TensorDict, loss_function: Optional[Callable] = None) -> Any:
