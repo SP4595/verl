@@ -352,6 +352,8 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
         with marked_timer("step", self.timing_raw):
             
             
+            
+            # 首先生成
             batch, batch_data_future = await self._fit_generate(batch_data_future, continuous_iterator)
 
             # await asyncio.sleep(0) ensures:
@@ -363,16 +365,28 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
             # `self.async_rollout_manager.generate_sequences(gen_batch_output)`,
             # the subsequent relevant logic can proceed in a timely manner
             await asyncio.sleep(0)
+            
+            # 然后 计算 reward
             batch = self._fit_compute_reward(batch)
             await asyncio.sleep(0)
+            
+            # 计算回答的 log prob
             batch = self._fit_compute_log_prob(batch)
             await asyncio.sleep(0)
+            
+            # 计算 ref log prob
             batch = self._fit_compute_ref_log_prob(batch)
             await asyncio.sleep(0)
+            
+            # 计算 critic
             batch = self._fit_compute_critic(batch)
             await asyncio.sleep(0)
+            
+            # 计算 advantage
             batch = self._fit_compute_advantage(batch)
             await asyncio.sleep(0)
+            
+            # 更新
             batch = self._fit_update_critic(batch)
             await asyncio.sleep(0)
             batch = self._fit_update_actor(batch)
