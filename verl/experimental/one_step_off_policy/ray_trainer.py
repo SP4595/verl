@@ -409,6 +409,7 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
         metrics = self.metrics
         timing_raw = self.timing_raw
 
+
         with marked_timer("gen", timing_raw, color="red"):
             _metrics, _timing_raw, epoch, batch, future_reward = await batch_data_future
             batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
